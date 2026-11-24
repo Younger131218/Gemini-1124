@@ -7,6 +7,8 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
 import numpy as np
 
 from ipcr.architecture.frame_floors import FloorCeilingResult

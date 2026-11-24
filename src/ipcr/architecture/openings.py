@@ -18,33 +18,42 @@ def _match_cluster_to_host_wall(
     pts_uvz: np.ndarray,
     walls: list[WallSegment],
     max_dist_m: float,
+    *,
+    kind: str = "window",
 ) -> tuple[WallSegment | None, float, float, float]:
-    """Find best host wall for a door/window cluster (requiring wall length >= opening width)."""
+    """Find best host wall for a door/window cluster (handles both closed and open-swing doors)."""
     best_wall: WallSegment | None = None
     best_score = -1.0
     best_bounds = (0.0, 0.0, 999.0)
 
+    # Open doors swing up to ~0.95m into the room while their hinge/frame stays near the wall!
+    near_dist = max_dist_m
+    swing_dist = 1.05 if kind == "door" else max_dist_m
+    min_inlier_ratio = 0.25 if kind == "door" else 0.50
+
     for w in walls:
         if w.length_m < 0.55:
-            # Tiny corner-step edges are never standalone door/window hosts
             continue
         rel = pts_uvz[:, :2] - w.p0_xy[None, :]
         s = rel @ w.tangent_xy
         d = rel @ w.normal_xy
-        in_d = (d >= -max_dist_m) & (d <= w.thickness_m + max_dist_m)
         in_s = (s >= -0.25) & (s <= w.length_m + 0.25)
-        m = in_d & in_s
-        inlier_ratio = float(np.mean(m))
-        if inlier_ratio < 0.50:
+        in_near = (d >= -near_dist) & (d <= w.thickness_m + near_dist) & in_s
+        in_swing = (d >= -swing_dist) & (d <= w.thickness_m + near_dist) & in_s
+
+        near_ratio = float(np.mean(in_near))
+        swing_ratio = float(np.mean(in_swing))
+        if near_ratio < min_inlier_ratio or swing_ratio < 0.55:
             continue
-        s_in = s[m]
-        s_lo = float(np.clip(np.percentile(s_in, 2), 0.08, w.length_m - 0.08))
-        s_hi = float(np.clip(np.percentile(s_in, 98), 0.08, w.length_m - 0.08))
+        # For open doors, use all swing points to span full doorway width if hinge side is near wall,
+        # otherwise prefer the near-wall frame points
+        s_src = s[in_near] if near_ratio >= 0.50 else s[in_swing]
+        s_lo = float(np.clip(np.percentile(s_src, 2), 0.08, w.length_m - 0.08))
+        s_hi = float(np.clip(np.percentile(s_src, 98), 0.08, w.length_m - 0.08))
         if s_hi - s_lo < 0.30:
             continue
-        med_d = float(np.median(np.abs(d[m] - 0.5 * w.thickness_m)))
-        # Prefer longer walls with closer perpendicular fit
-        score = (inlier_ratio * min(w.length_m, 4.0)) / (0.05 + med_d)
+        med_d = float(np.median(np.abs(d[in_near] - 0.5 * w.thickness_m)))
+        score = (swing_ratio * min(w.length_m, 4.0)) / (0.05 + med_d)
         if score > best_score:
             best_score = score
             best_wall = w
@@ -149,7 +158,7 @@ def detect_and_bind_openings(
                 continue
             sub = pts[comp]
             host, s_lo, s_hi, med_d = _match_cluster_to_host_wall(
-                sub, shell.walls, max_dist_m=max(cfg.opening_host_max_dist_m, 0.45)
+                sub, shell.walls, max_dist_m=max(cfg.opening_host_max_dist_m, 0.45), kind=kind
             )
             if host is None:
                 rejected.append({
@@ -160,10 +169,45 @@ def detect_and_bind_openings(
                 })
                 continue
 
+            # Intersect the opening's 2D wall strip strictly with host_poly.buffer(-0.004)
+            # so no opening frame/leaf can EVER enter a neighboring wall's mitered corner!
+            from shapely.geometry import MultiPolygon, Polygon
+
+            wpoly = shell.wall_polys_uv[host.wall_id]
+            safe_host = wpoly.buffer(-0.004)
             z_lo = float(np.percentile(sub[:, 2], 2))
             z_hi = float(np.percentile(sub[:, 2], 98))
-            s_lo = max(s_lo, 0.14)  # Stay safely clear of corner miters
-            s_hi = min(s_hi, host.length_m - 0.14)
+            p0, t_dir, n_dir = host.p0_xy, host.tangent_xy, host.normal_xy
+            th = host.thickness_m
+            op_rect = Polygon([
+                p0 + t_dir * s_lo + n_dir * 0.004,
+                p0 + t_dir * s_hi + n_dir * 0.004,
+                p0 + t_dir * s_hi + n_dir * (th - 0.004),
+                p0 + t_dir * s_lo + n_dir * (th - 0.004),
+            ])
+            safe_op = op_rect.intersection(safe_host).buffer(0)
+            if isinstance(safe_op, MultiPolygon):
+                safe_op = max(safe_op.geoms, key=lambda g: g.area)
+            if not isinstance(safe_op, Polygon) or safe_op.is_empty:
+                rejected.append({
+                    "kind": kind,
+                    "class_id": cid,
+                    "host_wall_id": host.wall_id,
+                    "point_count": int(len(comp)),
+                    "reason": "no_safe_span_inside_host_wall",
+                })
+                continue
+            # Find largest s-interval [sa, sb] where the full inner-to-outer depth stays inside safe_host
+            sv = (np.asarray(safe_op.exterior.coords, dtype=np.float64) - p0[None, :]) @ t_dir
+            dv = (np.asarray(safe_op.exterior.coords, dtype=np.float64) - p0[None, :]) @ n_dir
+            lo_edge = sv[dv <= 0.35 * th]
+            hi_edge = sv[dv >= 0.65 * th]
+            if len(lo_edge) >= 2 and len(hi_edge) >= 2:
+                s_lo = max(float(lo_edge.min()), float(hi_edge.min())) + 0.004
+                s_hi = min(float(lo_edge.max()), float(hi_edge.max())) - 0.004
+            else:
+                s_lo = float(sv.min()) + 0.004
+                s_hi = float(sv.max()) - 0.004
             z_hi = min(z_hi, host.z_max - 0.05)
 
             if s_hi - s_lo < cfg.opening_min_width_m or z_hi - z_lo < 0.25:

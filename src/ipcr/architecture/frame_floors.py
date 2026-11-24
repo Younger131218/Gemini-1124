@@ -142,10 +142,80 @@ def _raster_mask_to_polygon(mask: np.ndarray, u0: float, v0: float, cell: float)
     return merged
 
 
-def _snap_orthogonal_polygon(poly: Polygon, *, simplify_tol: float = 0.12, min_edge_len: float = 0.25) -> Polygon:
-    """Simplify raster staircase edges and snap near-axis-aligned wall edges cleanly."""
-    # Morphological smooth in vector space to remove 1-cell jagged notches
-    smoothed = poly.buffer(0.08, join_style=2).buffer(-0.08, join_style=2)
+def _remove_small_raster_jogs(pts: np.ndarray, *, max_jog_m: float = 0.45, min_neighbor_m: float = 1.2) -> np.ndarray:
+    """Eliminate spurious 1-4 cell raster staircase notches along straight walls while preserving true alcoves."""
+    arr = pts.copy()
+    for _ in range(4):
+        n = len(arr)
+        if n <= 4:
+            break
+        changed = False
+        for i in range(n):
+            p_prev = arr[(i - 1) % n]
+            p0 = arr[i]
+            p1 = arr[(i + 1) % n]
+            p_next = arr[(i + 2) % n]
+            e_prev = p0 - p_prev
+            e_cur = p1 - p0
+            e_next = p_next - p1
+            l_prev = float(np.linalg.norm(e_prev))
+            l_cur = float(np.linalg.norm(e_cur))
+            l_next = float(np.linalg.norm(e_next))
+            if l_cur > max_jog_m or l_prev < 1e-4 or l_next < 1e-4:
+                continue
+            # Check if previous and next edges are nearly parallel (same wall direction with a small lateral jog)
+            u_prev = e_prev / l_prev
+            u_next = e_next / l_next
+            if float(np.dot(u_prev, u_next)) > 0.96 and max(l_prev, l_next) >= min_neighbor_m:
+                # Project jog onto the longer neighbor's line!
+                if l_prev >= l_next:
+                    n_perp = np.array([-u_prev[1], u_prev[0]])
+                    # Shift p1 and p_next laterally onto p_prev->p0 line
+                    lat_p1 = float(np.dot(p1 - p0, n_perp))
+                    lat_pn = float(np.dot(p_next - p0, n_perp))
+                    if abs(lat_p1) <= max_jog_m:
+                        arr[(i + 1) % n] = p1 - n_perp * lat_p1
+                        arr[(i + 2) % n] = p_next - n_perp * lat_pn
+                        changed = True
+                        break
+                else:
+                    n_perp = np.array([-u_next[1], u_next[0]])
+                    lat_p0 = float(np.dot(p0 - p1, n_perp))
+                    lat_pp = float(np.dot(p_prev - p1, n_perp))
+                    if abs(lat_p0) <= max_jog_m:
+                        arr[i] = p0 - n_perp * lat_p0
+                        arr[(i - 1) % n] = p_prev - n_perp * lat_pp
+                        changed = True
+                        break
+        # Collapse newly collinear / zero-length vertices
+        cleaned: list[np.ndarray] = []
+        m = len(arr)
+        for k in range(m):
+            prev = arr[(k - 1) % m]
+            cur = arr[k]
+            nxt = arr[(k + 1) % m]
+            if np.linalg.norm(cur - prev) < 0.05:
+                continue
+            v1 = cur - prev
+            v2 = nxt - cur
+            n1 = float(np.linalg.norm(v1))
+            n2 = float(np.linalg.norm(v2))
+            if n1 > 1e-6 and n2 > 1e-6:
+                cross = abs(v1[0] * v2[1] - v1[1] * v2[0]) / (n1 * n2)
+                dot = (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)
+                if cross < 0.04 and dot > 0.0:
+                    continue
+            cleaned.append(cur)
+        if len(cleaned) >= 3:
+            arr = np.asarray(cleaned, dtype=np.float64)
+        if not changed:
+            break
+    return arr
+
+
+def _snap_orthogonal_polygon(poly: Polygon, *, simplify_tol: float = 0.14, min_edge_len: float = 0.25) -> Polygon:
+    """Simplify raster staircase edges, remove tiny wall kinks, and snap near-axis wall edges."""
+    smoothed = poly.buffer(0.10, join_style=2).buffer(-0.10, join_style=2)
     if isinstance(smoothed, MultiPolygon):
         smoothed = max(smoothed.geoms, key=lambda g: g.area)
     simp = smoothed.simplify(simplify_tol, preserve_topology=True)
@@ -155,7 +225,6 @@ def _snap_orthogonal_polygon(poly: Polygon, *, simplify_tol: float = 0.12, min_e
     if len(coords) < 3:
         return orient(poly, sign=1.0)
 
-    # Iteratively snap edges within 12 deg of U or V axis to exact constant U or V
     pts = np.asarray(coords, dtype=np.float64)
     for _ in range(3):
         n = len(pts)
@@ -167,35 +236,16 @@ def _snap_orthogonal_polygon(poly: Polygon, *, simplify_tol: float = 0.12, min_e
             if length < 1e-4:
                 continue
             ang = abs(float(np.degrees(np.arctan2(abs(dy), abs(dx)))))
-            if ang < 12.0:  # near horizontal (constant v)
+            if ang < 12.0:
                 mid_v = 0.5 * (pts[i, 1] + pts[j, 1])
                 pts[i, 1] = mid_v
                 pts[j, 1] = mid_v
-            elif ang > 78.0:  # near vertical (constant u)
+            elif ang > 78.0:
                 mid_u = 0.5 * (pts[i, 0] + pts[j, 0])
                 pts[i, 0] = mid_u
                 pts[j, 0] = mid_u
 
-        # Collapse collinear / tiny edges
-        cleaned: list[np.ndarray] = []
-        for k in range(len(pts)):
-            prev = pts[(k - 1) % len(pts)]
-            cur = pts[k]
-            nxt = pts[(k + 1) % len(pts)]
-            if np.linalg.norm(cur - prev) < 0.05:
-                continue
-            v1 = cur - prev
-            v2 = nxt - cur
-            n1 = float(np.linalg.norm(v1))
-            n2 = float(np.linalg.norm(v2))
-            if n1 > 1e-6 and n2 > 1e-6:
-                cross = abs(v1[0] * v2[1] - v1[1] * v2[0]) / (n1 * n2)
-                dot = (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)
-                if cross < 0.03 and dot > 0.0:
-                    continue
-            cleaned.append(cur)
-        if len(cleaned) >= 3:
-            pts = np.asarray(cleaned, dtype=np.float64)
+        pts = _remove_small_raster_jogs(pts, max_jog_m=0.45, min_neighbor_m=1.2)
 
     cand = Polygon(pts).buffer(0)
     if isinstance(cand, MultiPolygon):
@@ -247,19 +297,15 @@ def _refine_footprint_edges_to_walls(
         snapped = False
         c_new = c0
         if cnt >= min_support_pts:
-            # Use 25th percentile along outward normal (inner room surface of the wall!)
-            # so wall thickness extends cleanly outward without shrinking the room
+            # Find the DOMINANT vertical wall plane peak (argmax of 2cm histogram) rather than
+            # a weak inner tail, preventing furniture/baseboard bleed from pulling the wall inward!
             d_vals = d_perp[mask]
-            # Histogram peak in 2cm bins for inner wall surface
             d_lo, d_hi = float(d_vals.min()), float(d_vals.max())
             if d_hi - d_lo > 0.04:
                 bins = np.arange(d_lo - 0.01, d_hi + 0.03, 0.02)
                 hist, edges = np.histogram(d_vals, bins=bins)
-                # Find innermost significant peak (>= 35% of max peak)
-                pk_max = float(hist.max())
-                sig_bins = np.flatnonzero(hist >= 0.35 * pk_max)
-                inner_bin = int(sig_bins[0])
-                peak_d = 0.5 * (edges[inner_bin] + edges[inner_bin + 1])
+                dom_bin = int(np.argmax(hist))
+                peak_d = 0.5 * (edges[dom_bin] + edges[dom_bin + 1])
                 in_band = d_vals[np.abs(d_vals - peak_d) <= 0.035]
                 shift = float(np.median(in_band)) if len(in_band) else peak_d
             else:
