@@ -1,4 +1,4 @@
-"""End-to-end Stage 1 architectural reconstruction pipeline (raw LAS -> Z/Y GLB -> independent validation)."""
+"""End-to-end Stage 1 (architecture) and Stage 2 (architecture + furniture) reconstruction pipeline."""
 
 from __future__ import annotations
 
@@ -20,6 +20,13 @@ from ipcr.architecture.walls_shell import (
 from ipcr.baseline import verify_frozen_baseline
 from ipcr.config import PipelineConfig, load_class_ids
 from ipcr.export_glb import export_glb_pair
+from ipcr.furniture import (
+    FurnitureLibrary,
+    build_cabinet_parts,
+    build_chair_parts,
+    build_sofa_parts,
+    build_table_parts,
+)
 from ipcr.io_las import load_las, preflight_summary
 from ipcr.types import MeshPart, SceneBuildResult
 from ipcr.validator.cloud_metrics import compute_bidirectional_class_metrics
@@ -29,15 +36,20 @@ from ipcr.visualize import render_arch_review_png
 from ipcr.working_labels import build_working_labels
 
 
-def run_arch_pipeline(
+def run_pipeline(
     las_path: str | Path,
     output_dir: str | Path,
     *,
+    stage: str = "furniture",
     cfg: PipelineConfig | None = None,
+    library_root: str | Path | None = None,
     basename: str | None = None,
     render_preview: bool = True,
 ) -> dict[str, Any]:
-    """Run full Stage 1 architecture reconstruction from raw LAS with independent post-export validation."""
+    """Run Stage 1 ('arch') or Stage 2 ('furniture') reconstruction with independent post-export validation."""
+    if stage not in ("arch", "furniture"):
+        raise ValueError(f"Unsupported stage: {stage!r} (expected 'arch' or 'furniture')")
+
     t0 = time.perf_counter()
     baseline_res = verify_frozen_baseline()
     pcfg = cfg or PipelineConfig.load()
@@ -108,6 +120,44 @@ def run_arch_pipeline(
     parts.extend(beam_parts)
     parts.extend(stair_parts)
 
+    # 6. Stage 2 Furniture: Tables (8) -> Cabinets (9) -> Sofas (10) -> Library-Matched Chairs (7)
+    furniture_audit: dict[str, Any] | None = None
+    if stage == "furniture" and pcfg.furniture.enabled:
+        lib_path = library_root if library_root is not None else pcfg.furniture.model_library_path
+        library = FurnitureLibrary(library_root=lib_path)
+
+        static_blockers = [*int_wall_polys_uv, *col_polys_uv]
+        z_blockers = [*stair_beam_blockers]
+
+        table_parts, table_specs, table_audit = build_table_parts(
+            fc, shell, static_blockers, z_blockers, cloud.points_local, wl_state.work_labels, pcfg.furniture
+        )
+        parts.extend(table_parts)
+
+        cab_parts, cab_bands, cab_audit = build_cabinet_parts(
+            fc, shell, static_blockers, z_blockers, table_specs, cloud.points_local, wl_state.work_labels, pcfg.furniture
+        )
+        parts.extend(cab_parts)
+
+        sofa_blockers = [*z_blockers, *cab_bands, *[(ts.poly_uv, ts.z_floor, ts.z_top) for ts in table_specs]]
+        sofa_parts, sofa_bands, sofa_audit = build_sofa_parts(
+            fc, shell, static_blockers, sofa_blockers, cloud.points_local, wl_state.work_labels, pcfg.furniture
+        )
+        parts.extend(sofa_parts)
+
+        chair_parts, chair_audit = build_chair_parts(
+            fc, shell, parts, table_specs, library, cloud.points_local, wl_state.work_labels, pcfg.furniture
+        )
+        parts.extend(chair_parts)
+
+        furniture_audit = {
+            "library": library.to_audit_dict(),
+            "tables": table_audit,
+            "cabinets": cab_audit,
+            "sofas": sofa_audit,
+            "chairs": chair_audit,
+        }
+
     scene = SceneBuildResult(
         origin_xyz=cloud.origin_xyz,
         parts=parts,
@@ -118,21 +168,23 @@ def run_arch_pipeline(
         main_angle_rad=fc.frame.angle_rad,
     )
 
-    # 6. Export R23 paired Z-up & Y-up GLBs
+    stage_label = "stage2_arch_and_furniture" if stage == "furniture" else "stage1_architecture"
+
+    # 7. Export R23 paired Z-up & Y-up GLBs
     export_info = export_glb_pair(
         scene,
         out_dir,
         bname,
         scene_extras={
             "ipcr_version": __version__,
-            "stage": "stage1_architecture",
+            "stage": stage_label,
             "baseline_version": baseline_res.version,
             "baseline_sha256": baseline_res.actual_sha256,
             "input_las_sha256": cloud.sha256,
         },
     )
 
-    # 7. Independent post-export validation (B22-B26)
+    # 8. Independent post-export validation (B22-B26)
     glb_val = validate_glb_pair(
         export_info["zup_path"],
         export_info["yup_path"],
@@ -140,13 +192,20 @@ def run_arch_pipeline(
         require_ceiling=(fc.ceiling_z is not None),
     )
     rel_audit = audit_part_pair_intersections(parts, eps=1e-3)
-    arch_classes = [1, 2, 3, 4, 5, 6, 11]
+
+    eval_classes = [1, 2, 3, 4, 5, 6, 11]
     if any(p.class_id == 13 for p in parts) or stair_audit.get("stair_points_after_working_labels", 0) > 0:
-        arch_classes.append(13)
+        eval_classes.append(13)
     if any(p.class_id == 14 for p in parts) or stair_audit.get("railing_points_after_working_labels", 0) > 0:
-        arch_classes.append(14)
+        eval_classes.append(14)
+    if stage == "furniture":
+        for fcid in (7, 8, 9, 10):
+            if any(p.class_id == fcid for p in parts) or int((wl_state.work_labels == fcid).sum()) > 0:
+                eval_classes.append(fcid)
+    eval_classes = sorted(set(eval_classes))
+
     cloud_metrics = compute_bidirectional_class_metrics(
-        cloud.points_local, wl_state.work_labels, parts, target_classes=arch_classes, cfg=pcfg.validation
+        cloud.points_local, wl_state.work_labels, parts, target_classes=eval_classes, cfg=pcfg.validation
     )
 
     preview_path = None
@@ -156,9 +215,16 @@ def run_arch_pipeline(
     elapsed = round(time.perf_counter() - t0, 3)
     overall_pass = glb_val["status"] == "PASS" and rel_audit["status"] == "PASS"
 
+    not_checked = [
+        "Stage 3 regular clutter (class 12) not yet built",
+        "User visual overlay acceptance in host software pending",
+    ]
+    if stage == "arch":
+        not_checked.insert(0, "Stage 2 furniture (classes 7, 8, 9, 10) not built in stage=arch")
+
     report: dict[str, Any] = {
         "status": "PASS" if overall_pass else "FAIL",
-        "stage": "stage1_architecture",
+        "stage": stage_label,
         "user_visual_acceptance": "pending_review",
         "formal_release_approved": False,
         "elapsed_seconds": elapsed,
@@ -185,19 +251,35 @@ def run_arch_pipeline(
             "beams": beam_audit,
             "stairs_railings": stair_audit,
         },
+        "furniture": furniture_audit,
         "export": export_info,
         "glb_validation": glb_val,
         "relation_audit": rel_audit,
         "cloud_metrics": cloud_metrics,
         "review_overlay_png": preview_path,
-        "not_checked_scope": [
-            "Stage 2 furniture (classes 7, 8, 9, 10) not yet built in stage=arch",
-            "Stage 3 regular clutter (class 12) not yet built in stage=arch",
-            "User visual overlay acceptance in host software pending",
-        ],
+        "not_checked_scope": not_checked,
     }
 
     (out_dir / "run_report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     return report
+
+
+def run_arch_pipeline(
+    las_path: str | Path,
+    output_dir: str | Path,
+    *,
+    cfg: PipelineConfig | None = None,
+    basename: str | None = None,
+    render_preview: bool = True,
+) -> dict[str, Any]:
+    """Backward-compatible Stage 1 architecture-only runner."""
+    return run_pipeline(
+        las_path,
+        output_dir,
+        stage="arch",
+        cfg=cfg,
+        basename=basename,
+        render_preview=render_preview,
+    )

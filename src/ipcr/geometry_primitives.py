@@ -15,11 +15,13 @@ except ImportError:  # pragma: no cover
 def signed_mesh_volume(vertices: np.ndarray, triangles: np.ndarray) -> float:
     v = np.asarray(vertices, dtype=np.float64)
     t = np.asarray(triangles, dtype=np.int64).reshape(-1, 3)
-    if len(t) == 0:
+    if len(t) == 0 or len(v) == 0:
         return 0.0
-    v0 = v[t[:, 0]]
-    v1 = v[t[:, 1]]
-    v2 = v[t[:, 2]]
+    # Shift by v[0] (exact translation invariance!) to eliminate catastrophic cancellation at large UTM world coords!
+    v_rel = v - v[0]
+    v0 = v_rel[t[:, 0]]
+    v1 = v_rel[t[:, 1]]
+    v2 = v_rel[t[:, 2]]
     return float(np.sum(np.einsum("ij,ij->i", v0, np.cross(v1, v2))) / 6.0)
 
 

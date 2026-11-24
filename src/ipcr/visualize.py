@@ -45,7 +45,8 @@ def render_arch_review_png(
     uvz = fc.frame.pts_to_uvz(pts)
 
     fig, axes = plt.subplots(2, 2, figsize=(15, 12), dpi=130)
-    fig.suptitle(f"IPCR v2 Stage-1 Architecture Review ({Path(cloud.source_path).name})", fontsize=13)
+    stage_title = "Stage-2 Architecture & Furniture Review" if any(p.class_id in (7, 8, 9, 10) for p in parts) else "Stage-1 Architecture Review"
+    fig.suptitle(f"IPCR v2 {stage_title} ({Path(cloud.source_path).name})", fontsize=13)
 
     # Panel 1: Room-aligned UV Top-Down Plan (structural point cloud vs outer/inner shell + openings + columns)
     ax = axes[0, 0]
@@ -121,30 +122,54 @@ def render_arch_review_png(
     ax.legend(loc="lower right", fontsize=7, markerscale=6)
     ax.grid(True, alpha=0.25)
 
-    # Panel 3: Beams & Columns UV Plan
+    # Panel 3: Furniture (when built) OR Beams & Columns UV Plan
     ax = axes[1, 0]
-    ax.set_title("3. Overhead Beams (cls 3) & Columns (cls 4) Clipped Inside Shell")
-    idx3 = np.flatnonzero(wl == 3)
-    if len(idx3) > 12000:
-        idx3 = rng.choice(idx3, size=12000, replace=False)
-    if len(idx3):
-        ax.scatter(uvz[idx3, 0], uvz[idx3, 1], s=0.7, alpha=0.35, color="#8bc34a", label="beam cloud")
-    ax.plot(ix, iy, color="black", lw=1.8)
-    for p in parts:
-        if p.class_id in (3, 4):
+    has_furniture = any(p.class_id in (7, 8, 9, 10) for p in parts)
+    if has_furniture:
+        ax.set_title("3. Stage-2 Furniture Plan: Cloud vs Reconstructed Tables / Chairs / Cabinets / Sofas")
+        for fcid, flbl in ((8, "table cloud"), (7, "chair cloud"), (9, "cabinet cloud"), (10, "sofa cloud")):
+            fidx = np.flatnonzero(wl == fcid)
+            if len(fidx) == 0:
+                continue
+            if len(fidx) > 8000:
+                fidx = rng.choice(fidx, size=8000, replace=False)
+            rgba = palette.get(str(fcid), {}).get("rgba", [0.5, 0.5, 0.5, 1.0])
+            ax.scatter(uvz[fidx, 0], uvz[fidx, 1], s=0.8, alpha=0.35, color=rgba[:3], label=flbl)
+        ax.plot(ix, iy, color="black", lw=1.8)
+        fcolors = {7: "#4a148c", 8: "#1b5e20", 9: "#b71c1c", 10: "#880e4f"}
+        for p in parts:
+            if p.class_id not in (7, 8, 9, 10):
+                continue
+            if p.role == "table_leg":
+                continue
             puv = fc.frame.pts_to_uvz(p.vertices)
-            # Plot triangle edges lightly
-            tris = p.triangles
-            color = "#2e7d32" if p.class_id == 3 else "#c2185b"
-            if len(tris) <= 400:
-                for a, b, c in tris:
-                    ax.plot(
-                        [puv[a, 0], puv[b, 0], puv[c, 0], puv[a, 0]],
-                        [puv[a, 1], puv[b, 1], puv[c, 1], puv[a, 1]],
-                        color=color,
-                        lw=0.4,
-                        alpha=0.5,
-                    )
+            u0, v0 = puv[:, 0].min(), puv[:, 1].min()
+            u1, v1 = puv[:, 0].max(), puv[:, 1].max()
+            lw = 1.6 if p.class_id in (8, 9, 10) else 1.2
+            ax.plot([u0, u1, u1, u0, u0], [v0, v0, v1, v1, v0], color=fcolors[p.class_id], lw=lw)
+        ax.legend(loc="upper right", fontsize=7, markerscale=5)
+    else:
+        ax.set_title("3. Overhead Beams (cls 3) & Columns (cls 4) Clipped Inside Shell")
+        idx3 = np.flatnonzero(wl == 3)
+        if len(idx3) > 12000:
+            idx3 = rng.choice(idx3, size=12000, replace=False)
+        if len(idx3):
+            ax.scatter(uvz[idx3, 0], uvz[idx3, 1], s=0.7, alpha=0.35, color="#8bc34a", label="beam cloud")
+        ax.plot(ix, iy, color="black", lw=1.8)
+        for p in parts:
+            if p.class_id in (3, 4):
+                puv = fc.frame.pts_to_uvz(p.vertices)
+                tris = p.triangles
+                color = "#2e7d32" if p.class_id == 3 else "#c2185b"
+                if len(tris) <= 400:
+                    for a, b, c in tris:
+                        ax.plot(
+                            [puv[a, 0], puv[b, 0], puv[c, 0], puv[a, 0]],
+                            [puv[a, 1], puv[b, 1], puv[c, 1], puv[a, 1]],
+                            color=color,
+                            lw=0.4,
+                            alpha=0.5,
+                        )
     ax.set_aspect("equal", "box")
     ax.set_xlabel("u (m)")
     ax.set_ylabel("v (m)")

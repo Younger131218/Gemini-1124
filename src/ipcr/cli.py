@@ -39,7 +39,8 @@ def main(argv: list[str] | None = None) -> int:
     p_run = sub.add_parser("run", help="Run end-to-end reconstruction pipeline from raw LAS")
     p_run.add_argument("--las", required=True, help="Path to classified uncompressed .las")
     p_run.add_argument("--out", required=True, help="New output directory (never overwrites existing)")
-    p_run.add_argument("--stage", choices=["arch"], default="arch", help="Pipeline stage target")
+    p_run.add_argument("--stage", choices=["arch", "furniture"], default="furniture", help="Pipeline stage target")
+    p_run.add_argument("--library", default=None, help="Path to read-only GLB model library directory")
     p_run.add_argument("--config", default=None, help="Optional pipeline config JSON path")
     p_run.add_argument("--basename", default=None, help="Optional output basename (defaults to LAS stem)")
 
@@ -79,10 +80,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "run":
         verify_frozen_baseline()
-        from ipcr.pipeline import run_arch_pipeline
+        from ipcr.pipeline import run_pipeline
 
         cfg = PipelineConfig.load(Path(args.config) if args.config else None)
-        report = run_arch_pipeline(args.las, args.out, cfg=cfg, basename=args.basename)
+        report = run_pipeline(
+            args.las,
+            args.out,
+            stage=args.stage,
+            cfg=cfg,
+            library_root=args.library,
+            basename=args.basename,
+        )
         print(json.dumps({
             "status": report["status"],
             "out_dir": str(Path(args.out).resolve()),

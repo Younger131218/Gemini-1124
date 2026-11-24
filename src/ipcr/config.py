@@ -67,6 +67,31 @@ class ArchitectureConfig:
 
 
 @dataclass
+class FurnitureConfig:
+    enabled: bool = True
+    model_library_path: str | None = None
+    table_min_points: int = 800
+    table_min_area_m2: float = 0.20
+    table_min_height_m: float = 0.42
+    table_max_height_m: float = 1.35
+    table_top_thickness_m: float = 0.048
+    table_leg_size_m: float = 0.055
+    cabinet_min_points: int = 800
+    cabinet_min_depth_m: float = 0.16
+    cabinet_min_width_m: float = 0.28
+    cabinet_min_height_m: float = 0.35
+    sofa_min_points: int = 1000
+    sofa_min_depth_m: float = 0.48
+    sofa_min_width_m: float = 0.70
+    sofa_min_height_m: float = 0.50
+    chair_min_points: int = 250
+    chair_min_height_m: float = 0.45
+    chair_max_height_m: float = 1.35
+    chair_row_slot_m: float = 0.68
+    clearance_m: float = 0.010
+
+
+@dataclass
 class ValidationConfig:
     min_triangle_area_m2: float = 1e-10
     min_solid_volume_m3: float = 1e-7
@@ -82,6 +107,7 @@ class PipelineConfig:
     schema_version: int = 1
     working_labels: WorkingLabelConfig = field(default_factory=WorkingLabelConfig)
     architecture: ArchitectureConfig = field(default_factory=ArchitectureConfig)
+    furniture: FurnitureConfig = field(default_factory=FurnitureConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
 
     def to_dict(self) -> dict[str, Any]:
@@ -93,6 +119,7 @@ class PipelineConfig:
             schema_version=int(data.get("schema_version", 1)),
             working_labels=WorkingLabelConfig(**data.get("working_labels", {})),
             architecture=ArchitectureConfig(**data.get("architecture", {})),
+            furniture=FurnitureConfig(**data.get("furniture", {})),
             validation=ValidationConfig(**data.get("validation", {})),
         )
 
