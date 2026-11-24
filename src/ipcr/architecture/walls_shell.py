@@ -345,29 +345,30 @@ def build_interior_wall_parts(
     points_local: np.ndarray,
     work_labels: np.ndarray,
     cfg: ArchitectureConfig,
-) -> tuple[list[MeshPart], list[Polygon], dict[str, Any]]:
+) -> tuple[list[MeshPart], list[Polygon], list[tuple[Polygon, float, float]], dict[str, Any]]:
     """Detect and build standalone interior partition walls strictly inside inner_uv (zero exterior overlap)."""
     uvz = fc.frame.pts_to_uvz(points_local)
     wpts = uvz[work_labels == 2]
     if len(wpts) < cfg.wall_min_points:
-        return [], [], {"interior_wall_count": 0, "walls": []}
+        return [], [], [], {"interior_wall_count": 0, "walls": []}
 
     # Exclude wall points within 0.45m of the exterior wall band (avoid duplicating exterior wall scans!)
     from shapely import contains_xy
 
     inner_core = shell.inner_uv.buffer(-0.45)
     if inner_core.is_empty:
-        return [], [], {"interior_wall_count": 0, "walls": []}
+        return [], [], [], {"interior_wall_count": 0, "walls": []}
 
     in_mask = contains_xy(inner_core, wpts[:, 0], wpts[:, 1])
     int_pts = wpts[in_mask]
     if len(int_pts) < cfg.wall_min_points:
-        return [], [], {"interior_wall_count": 0, "walls": []}
+        return [], [], [], {"interior_wall_count": 0, "walls": []}
 
     z_top_limit = fc.ceiling_z if fc.ceiling_z is not None else float(np.percentile(wpts[:, 2], 98))
     comps = _voxel_connected_components_3d(int_pts, voxel_size=0.12)
     parts: list[MeshPart] = []
     polys_uv: list[Polygon] = []
+    slab_cutouts: list[tuple[Polygon, float, float]] = []
     logs: list[dict[str, Any]] = []
     allowed = shell.inner_uv.buffer(-0.005)
     placed_union: Polygon | MultiPolygon | None = None
@@ -376,14 +377,12 @@ def build_interior_wall_parts(
         if len(comp) < cfg.wall_min_points:
             continue
         sub = int_pts[comp]
-        # Fit 2D principal axis in UV
         mean_uv = sub[:, :2].mean(axis=0)
         centered = sub[:, :2] - mean_uv
         cov = centered.T @ centered / max(len(sub), 1)
         eigvals, eigvecs = np.linalg.eigh(cov)
         t_dir = eigvecs[:, 1]
         n_dir = eigvecs[:, 0]
-        # Snap to room U/V axis if within 10 degrees
         ang = abs(float(np.degrees(np.arctan2(abs(t_dir[1]), abs(t_dir[0])))))
         if ang < 10.0:
             t_dir = np.array([1.0, 0.0])
@@ -404,7 +403,6 @@ def build_interior_wall_parts(
         if length < cfg.wall_min_length_m or (z_hi - z_lo) < cfg.wall_min_height_m:
             continue
         if meas_thick > 0.60:
-            # Too bulky to be a single planar partition wall
             continue
 
         thick = float(np.clip(max(meas_thick, cfg.min_wall_thickness_m), cfg.min_wall_thickness_m, cfg.max_wall_thickness_m))
@@ -415,19 +413,36 @@ def build_interior_wall_parts(
         p3 = mean_uv + t_dir * s_lo + n_dir * (d_mid + 0.5 * thick)
         poly = Polygon([p0, p1, p2, p3]).intersection(allowed).buffer(0)
         if placed_union is not None and not placed_union.is_empty:
-            poly = poly.difference(placed_union).buffer(0)
+            poly = poly.difference(placed_union.buffer(0.004)).buffer(0)
         if isinstance(poly, MultiPolygon):
             poly = max(poly.geoms, key=lambda g: g.area)
         if not isinstance(poly, Polygon) or poly.is_empty or poly.area < 0.03:
             continue
 
-        # Snap bottom to floor_z if close, top to ceiling_z if close
-        z0 = fc.floor_z + 0.001 if z_lo <= fc.floor_z + 0.30 else max(z_lo, fc.floor_z + 0.001)
-        z1 = z_top_limit - 0.001 if z_hi >= z_top_limit - 0.30 else min(z_hi, z_top_limit - 0.001)
+        # Snap bottom to nearest supporting floor level
+        base_z = fc.floor_z
+        for flv in fc.floor_levels:
+            if not flv.is_primary and flv.polygon_uv.intersects(poly) and abs(z_lo - flv.z_top) <= 0.40:
+                base_z = max(base_z, flv.z_top)
+        z0 = base_z + 0.002 if z_lo <= base_z + 0.30 else max(z_lo, base_z + 0.002)
+
+        # Snap top to local overhead slab if close (avoid piercing mezzanine or lower ceiling)
+        local_top = z_top_limit
+        for clv in fc.ceiling_levels:
+            if not clv.is_primary and clv.z_bottom > z0 + 0.30 and clv.polygon_uv.intersects(poly):
+                local_top = min(local_top, clv.z_bottom)
+        for flv in fc.floor_levels:
+            if not flv.is_primary and flv.z_top - cfg.floor_thickness_m > z0 + 0.30 and flv.polygon_uv.intersects(poly):
+                if float(np.mean(sub[:, 2] > flv.z_top + 0.25)) < 0.08:
+                    local_top = min(local_top, flv.z_top - cfg.floor_thickness_m)
+
+        z1 = local_top - 0.002 if z_hi >= local_top - 0.35 else min(z_hi, local_top - 0.002)
         if z1 <= z0 + 0.30:
             continue
 
-        poly_clean = orient(Polygon(poly.exterior.coords), sign=1.0)
+        poly_clean = orient(poly.buffer(0), sign=1.0)
+        if isinstance(poly_clean, MultiPolygon):
+            poly_clean = max(poly_clean.geoms, key=lambda g: g.area)
         v_uv, tri = extrude_polygon_solid(poly_clean, z0, z1)
         pid = f"int_wall_{len(parts):02d}"
         parts.append(
@@ -447,7 +462,8 @@ def build_interior_wall_parts(
             )
         )
         polys_uv.append(poly_clean)
+        slab_cutouts.append((poly_clean, z0, z1))
         placed_union = poly_clean if placed_union is None else unary_union([placed_union, poly_clean])
         logs.append(parts[-1].metadata | {"part_id": pid})
 
-    return parts, polys_uv, {"interior_wall_count": len(parts), "walls": logs}
+    return parts, polys_uv, slab_cutouts, {"interior_wall_count": len(parts), "walls": logs}

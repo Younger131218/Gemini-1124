@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 from scipy import ndimage
-from shapely.geometry import MultiPolygon, Polygon
+from shapely.geometry import MultiPolygon, Polygon, box
 from shapely.geometry.polygon import orient
 from shapely.ops import unary_union
 
@@ -51,12 +51,32 @@ class RoomFrame:
 
 
 @dataclass
+class FloorLevel:
+    level_id: int
+    z_top: float
+    polygon_uv: Polygon
+    point_count: int
+    is_primary: bool = False
+
+
+@dataclass
+class CeilingLevel:
+    level_id: int
+    z_bottom: float
+    polygon_uv: Polygon
+    point_count: int
+    is_primary: bool = False
+
+
+@dataclass
 class FloorCeilingResult:
     frame: RoomFrame
     floor_z: float
     ceiling_z: float | None
     inner_footprint_uv: Polygon
     audit: dict[str, Any]
+    floor_levels: list[FloorLevel] = field(default_factory=list)
+    ceiling_levels: list[CeilingLevel] = field(default_factory=list)
 
 
 def estimate_room_frame(points_local: np.ndarray, work_labels: np.ndarray) -> RoomFrame:
@@ -77,7 +97,6 @@ def estimate_room_frame(points_local: np.ndarray, work_labels: np.ndarray) -> Ro
         sy += weight * float(np.sin(4.0 * ang))
 
     angle = 0.25 * float(np.arctan2(sy, sx))
-    # Normalize to [-pi/4, pi/4) so axes stay close to world X/Y when unrotated
     while angle >= np.pi / 4.0:
         angle -= np.pi / 2.0
     while angle < -np.pi / 4.0:
@@ -97,11 +116,68 @@ def _dominant_z_peak(z_vals: np.ndarray, bin_size: float = 0.025) -> float:
     return float(np.median(band)) if len(band) else zc
 
 
+def _detect_z_peaks(
+    pts_uvz: np.ndarray,
+    *,
+    bin_size: float = 0.04,
+    min_sep_z: float = 1.5,
+    min_pts: int = 4000,
+    min_area_m2: float = 3.0,
+    band_half_m: float = 0.14,
+    max_levels: int = 4,
+) -> list[tuple[float, int]]:
+    """Detect distinct horizontal slab elevation peaks separated by at least min_sep_z."""
+    if len(pts_uvz) == 0:
+        return []
+    z_vals = pts_uvz[:, 2]
+    zmin, zmax = float(z_vals.min()), float(z_vals.max())
+    if zmax - zmin < min_sep_z:
+        zc = _dominant_z_peak(z_vals)
+        cnt = int(np.sum(np.abs(z_vals - zc) <= band_half_m))
+        return [(zc, cnt)]
+
+    bins = np.arange(zmin - bin_size * 0.5, zmax + bin_size * 1.5, bin_size)
+    hist, edges = np.histogram(z_vals, bins=bins)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    work_hist = hist.astype(np.int64).copy()
+
+    peaks: list[tuple[float, int]] = []
+    for _ in range(max_levels):
+        idx = int(np.argmax(work_hist))
+        if work_hist[idx] < max(20, min_pts // 25):
+            break
+        zc_raw = float(centers[idx])
+        # Suppress neighborhood before validation so we never stall on rejected sub-peaks
+        work_hist[np.abs(centers - zc_raw) < min_sep_z] = 0
+
+        band_mask = np.abs(z_vals - zc_raw) <= band_half_m
+        cnt = int(np.sum(band_mask))
+        if cnt < min_pts and len(peaks) > 0:
+            continue
+        band_pts = pts_uvz[band_mask]
+        zc = float(np.median(band_pts[:, 2]))
+
+        # Check 2D occupied area at 0.20m cells
+        cell = 0.20
+        iu = np.floor(band_pts[:, 0] / cell).astype(np.int64)
+        iv = np.floor(band_pts[:, 1] / cell).astype(np.int64)
+        keys = iu * 1_000_003 + iv
+        area_m2 = float(len(np.unique(keys))) * (cell * cell)
+        if area_m2 < min_area_m2 and len(peaks) > 0:
+            continue
+        peaks.append((zc, cnt))
+
+    if not peaks:
+        zc = _dominant_z_peak(z_vals)
+        peaks.append((zc, int(np.sum(np.abs(z_vals - zc) <= band_half_m))))
+
+    peaks.sort(key=lambda item: item[0])
+    return peaks
+
+
 def _raster_mask_to_polygon(mask: np.ndarray, u0: float, v0: float, cell: float) -> Polygon:
     """Convert a 2D boolean raster mask (no interior holes) into a clean Shapely Polygon."""
-    # Fill all interior scan-shadow holes (Q09/Q10/Q11)
     filled = ndimage.binary_fill_holes(mask)
-    # Keep largest connected component (or components >= 5% of largest)
     labeled, ncomp = ndimage.label(filled)
     if ncomp == 0:
         raise ValueError("Empty floor raster mask")
@@ -111,9 +187,6 @@ def _raster_mask_to_polygon(mask: np.ndarray, u0: float, v0: float, cell: float)
     for cid, sz in enumerate(sizes, start=1):
         if sz >= max(max_size * 0.05, 16):
             keep |= labeled == cid
-
-    # Build exact union of horizontal runs using shared edge arrays (avoids 1e-16 float seam gaps!)
-    from shapely.geometry import box
 
     rects: list[Polygon] = []
     nrows, ncols = keep.shape
@@ -135,7 +208,6 @@ def _raster_mask_to_polygon(mask: np.ndarray, u0: float, v0: float, cell: float)
     merged = unary_union(rects)
     if isinstance(merged, MultiPolygon):
         merged = max(merged.geoms, key=lambda g: g.area)
-    # Remove any accidental tiny interior rings (non-design holes)
     merged = orient(Polygon(merged.exterior.coords).buffer(0), sign=1.0)
     if isinstance(merged, MultiPolygon):
         merged = max(merged.geoms, key=lambda g: g.area)
@@ -163,14 +235,11 @@ def _remove_small_raster_jogs(pts: np.ndarray, *, max_jog_m: float = 0.45, min_n
             l_next = float(np.linalg.norm(e_next))
             if l_cur > max_jog_m or l_prev < 1e-4 or l_next < 1e-4:
                 continue
-            # Check if previous and next edges are nearly parallel (same wall direction with a small lateral jog)
             u_prev = e_prev / l_prev
             u_next = e_next / l_next
             if float(np.dot(u_prev, u_next)) > 0.96 and max(l_prev, l_next) >= min_neighbor_m:
-                # Project jog onto the longer neighbor's line!
                 if l_prev >= l_next:
                     n_perp = np.array([-u_prev[1], u_prev[0]])
-                    # Shift p1 and p_next laterally onto p_prev->p0 line
                     lat_p1 = float(np.dot(p1 - p0, n_perp))
                     lat_pn = float(np.dot(p_next - p0, n_perp))
                     if abs(lat_p1) <= max_jog_m:
@@ -187,7 +256,6 @@ def _remove_small_raster_jogs(pts: np.ndarray, *, max_jog_m: float = 0.45, min_n
                         arr[(i - 1) % n] = p_prev - n_perp * lat_pp
                         changed = True
                         break
-        # Collapse newly collinear / zero-length vertices
         cleaned: list[np.ndarray] = []
         m = len(arr)
         for k in range(m):
@@ -255,6 +323,31 @@ def _snap_orthogonal_polygon(poly: Polygon, *, simplify_tol: float = 0.14, min_e
     return orient(Polygon(cand.exterior.coords), sign=1.0)
 
 
+def _extract_level_polygon_uv(band_uv: np.ndarray, *, cell: float = 0.12) -> Polygon | None:
+    """Extract a clean hole-filled orthogonalized 2D polygon for an upper floor or secondary ceiling."""
+    if len(band_uv) < 50:
+        return None
+    pad = 0.70
+    u0 = float(band_uv[:, 0].min()) - pad
+    v0 = float(band_uv[:, 1].min()) - pad
+    u1 = float(band_uv[:, 0].max()) + pad
+    v1 = float(band_uv[:, 1].max()) + pad
+    nu = int(np.ceil((u1 - u0) / cell)) + 2
+    nv = int(np.ceil((v1 - v0) / cell)) + 2
+    grid = np.zeros((nu, nv), dtype=bool)
+    iu = np.clip(np.floor((band_uv[:, 0] - u0) / cell).astype(np.int64), 0, nu - 1)
+    iv = np.clip(np.floor((band_uv[:, 1] - v0) / cell).astype(np.int64), 0, nv - 1)
+    grid[iu, iv] = True
+    closed = ndimage.binary_closing(grid, structure=np.ones((5, 5), dtype=bool), iterations=2)
+    try:
+        raw = _raster_mask_to_polygon(closed, u0, v0, cell)
+    except ValueError:
+        return None
+    if raw.is_empty or raw.area < 1.0:
+        return None
+    return _snap_orthogonal_polygon(raw, simplify_tol=0.14)
+
+
 def _refine_footprint_edges_to_walls(
     poly_uv: Polygon,
     wall_uvz: np.ndarray,
@@ -268,7 +361,6 @@ def _refine_footprint_edges_to_walls(
     if n < 3 or len(wall_uvz) < 200:
         return poly_uv, []
 
-    # Build half-plane line equations for each edge: dot(p, outward_normal) = c
     normals = np.zeros((n, 2), dtype=np.float64)
     offsets = np.zeros(n, dtype=np.float64)
     edge_logs: list[dict[str, Any]] = []
@@ -284,21 +376,17 @@ def _refine_footprint_edges_to_walls(
             offsets[i] = float(np.dot(p0, normals[i]))
             continue
         t = seg / length
-        # For CCW polygon, outward normal is (t_y, -t_x)
         out_n = np.array([t[1], -t[0]], dtype=np.float64)
         c0 = float(np.dot(p0, out_n))
 
         rel = wall_uv - p0[None, :]
         s_proj = rel @ t
         d_perp = rel @ out_n
-        # Match wall points along this edge and within search band
         mask = (s_proj >= -0.10) & (s_proj <= length + 0.10) & (np.abs(d_perp) <= search_band_m)
         cnt = int(np.sum(mask))
         snapped = False
         c_new = c0
         if cnt >= min_support_pts:
-            # Find the DOMINANT vertical wall plane peak (argmax of 2cm histogram) rather than
-            # a weak inner tail, preventing furniture/baseboard bleed from pulling the wall inward!
             d_vals = d_perp[mask]
             d_lo, d_hi = float(d_vals.min()), float(d_vals.max())
             if d_hi - d_lo > 0.04:
@@ -323,7 +411,6 @@ def _refine_footprint_edges_to_walls(
             "shift_m": round(c_new - c0, 4),
         })
 
-    # Recompute exact corner intersections of consecutive snapped edge lines
     new_coords = coords.copy()
     for i in range(n):
         prev_i = (i - 1) % n
@@ -347,24 +434,77 @@ def analyze_floor_and_ceiling(
     work_labels: np.ndarray,
     cfg: ArchitectureConfig,
 ) -> FloorCeilingResult:
-    """Estimate principal frame, floor/ceiling elevations, and hole-free snapped room footprint."""
+    """Estimate principal frame, multi-storey floor/ceiling elevations, and hole-free snapped room footprint."""
     frame = estimate_room_frame(points_local, work_labels)
     uvz = frame.pts_to_uvz(points_local)
 
     floor_pts = uvz[work_labels == 1]
     if len(floor_pts) == 0:
         raise ValueError("Cannot build room domain: work_labels has 0 floor (class 1) points")
-    floor_z = _dominant_z_peak(floor_pts[:, 2])
 
+    # Detect all distinct storey floor elevations (separated by >= 1.5m)
+    floor_peaks = _detect_z_peaks(
+        floor_pts,
+        bin_size=0.04,
+        min_sep_z=1.5,
+        min_pts=max(1000, min(5000, int(len(floor_pts) * 0.02))),
+        min_area_m2=3.0,
+        band_half_m=0.16,
+    )
+    # Primary floor is the lowest elevation slab (1F)
+    floor_z = float(floor_peaks[0][0])
+
+    # Detect all distinct ceiling elevations (main roof + true lower/higher side-wing ceilings >= 0.85m apart)
     ceil_pts = uvz[work_labels == 11]
-    ceiling_z = _dominant_z_peak(ceil_pts[:, 2]) if len(ceil_pts) >= 200 else None
+    ceiling_levels: list[CeilingLevel] = []
+    ceiling_z: float | None = None
+    if len(ceil_pts) >= 200:
+        ceil_peaks = _detect_z_peaks(
+            ceil_pts,
+            bin_size=0.04,
+            min_sep_z=0.85,
+            min_pts=max(800, min(2000, int(len(ceil_pts) * 0.02))),
+            min_area_m2=2.0,
+            band_half_m=0.14,
+        )
+        # Primary ceiling is the dominant ceiling peak (largest point count)
+        dom_ceil_idx = int(np.argmax([cnt for _zc, cnt in ceil_peaks]))
+        ceiling_z = float(ceil_peaks[dom_ceil_idx][0])
+        raw_clvs: list[CeilingLevel] = []
+        primary_cpoly: Polygon | None = None
+        for cid, (zc, cnt) in enumerate(ceil_peaks):
+            band = ceil_pts[np.abs(ceil_pts[:, 2] - zc) <= 0.16, :2]
+            cpoly = _extract_level_polygon_uv(band, cell=0.12)
+            if cpoly is not None:
+                is_prim = cid == dom_ceil_idx
+                if is_prim:
+                    primary_cpoly = cpoly
+                raw_clvs.append(
+                    CeilingLevel(
+                        level_id=cid,
+                        z_bottom=float(zc),
+                        polygon_uv=cpoly,
+                        point_count=int(cnt),
+                        is_primary=is_prim,
+                    )
+                )
+        # Keep primary ceiling + genuine lower side-wing ceilings (below primary roof and >=50% outside primary XY)
+        for clv in raw_clvs:
+            if clv.is_primary or primary_cpoly is None:
+                ceiling_levels.append(clv)
+            else:
+                if clv.z_bottom > ceiling_z - 0.80:
+                    continue
+                outside_area = float(clv.polygon_uv.difference(primary_cpoly).area)
+                if outside_area >= max(1.5, float(clv.polygon_uv.area) * 0.50):
+                    ceiling_levels.append(clv)
 
-    # Build 2D occupancy grid combining floor + low/mid walls + doors/windows
-    # Generous padding (0.80m >> closing radius) prevents border erosion in binary_closing!
+    # Build Level-0 2D occupancy grid combining 1F floor + attached columns + stairs shadow footprint
     struct_mask = (
         (work_labels == 1)
         | ((work_labels == 2) & (uvz[:, 2] <= floor_z + 2.5))
         | (work_labels == 6)
+        | (work_labels == 13)
     )
     occ_uv = uvz[struct_mask, :2]
     cell = 0.10
@@ -376,19 +516,17 @@ def analyze_floor_and_ceiling(
     nu = int(np.ceil((u1 - u0) / cell)) + 2
     nv = int(np.ceil((v1 - v0) / cell)) + 2
 
-    # Include floor points + attached column footprints (so exterior walls run straight behind pilasters!)
-    floor_band = floor_pts[np.abs(floor_pts[:, 2] - floor_z) <= 0.15]
+    floor_band = floor_pts[np.abs(floor_pts[:, 2] - floor_z) <= 0.18]
     col_pts = uvz[(work_labels == 4) & (uvz[:, 2] >= floor_z - 0.10) & (uvz[:, 2] <= floor_z + 2.5)]
-    grid = np.zeros((nu, nv), dtype=bool)
-    iu = np.clip(np.floor((floor_band[:, 0] - u0) / cell).astype(np.int64), 0, nu - 1)
-    iv = np.clip(np.floor((floor_band[:, 1] - v0) / cell).astype(np.int64), 0, nv - 1)
-    grid[iu, iv] = True
-    if len(col_pts) > 0:
-        ciu = np.clip(np.floor((col_pts[:, 0] - u0) / cell).astype(np.int64), 0, nu - 1)
-        civ = np.clip(np.floor((col_pts[:, 1] - v0) / cell).astype(np.int64), 0, nv - 1)
-        grid[ciu, civ] = True
+    stair_pts = uvz[work_labels == 13]
 
-    # Morphological closing bridges furniture scan shadows & sparse scan gaps safely inside padding
+    grid = np.zeros((nu, nv), dtype=bool)
+    for pts_add in (floor_band, col_pts, stair_pts):
+        if len(pts_add) > 0:
+            iu = np.clip(np.floor((pts_add[:, 0] - u0) / cell).astype(np.int64), 0, nu - 1)
+            iv = np.clip(np.floor((pts_add[:, 1] - v0) / cell).astype(np.int64), 0, nv - 1)
+            grid[iu, iv] = True
+
     struct = np.ones((5, 5), dtype=bool)
     closed = ndimage.binary_closing(grid, structure=struct, iterations=2)
     raw_poly = _raster_mask_to_polygon(closed, u0, v0, cell)
@@ -397,16 +535,66 @@ def analyze_floor_and_ceiling(
     wall_uvz = uvz[work_labels == 2]
     snapped_poly, edge_logs = _refine_footprint_edges_to_walls(ortho_poly, wall_uvz)
 
+    # Assemble structured floor_levels (Level 0 = snapped primary footprint, Level k>=1 = upper mezzanines)
+    floor_levels: list[FloorLevel] = [
+        FloorLevel(
+            level_id=0,
+            z_top=floor_z,
+            polygon_uv=snapped_poly,
+            point_count=int(floor_peaks[0][1]),
+            is_primary=True,
+        )
+    ]
+    for fid, (zf, cnt) in enumerate(floor_peaks[1:], start=1):
+        band = floor_pts[np.abs(floor_pts[:, 2] - zf) <= 0.18, :2]
+        upoly = _extract_level_polygon_uv(band, cell=0.12)
+        if upoly is not None:
+            clipped = upoly.intersection(snapped_poly.buffer(0.05)).buffer(0)
+            if isinstance(clipped, MultiPolygon):
+                clipped = max(clipped.geoms, key=lambda g: g.area)
+            if isinstance(clipped, Polygon) and not clipped.is_empty and clipped.area >= 2.0:
+                floor_levels.append(
+                    FloorLevel(
+                        level_id=fid,
+                        z_top=float(zf),
+                        polygon_uv=orient(Polygon(clipped.exterior.coords).buffer(0), sign=1.0),
+                        point_count=int(cnt),
+                        is_primary=False,
+                    )
+                )
+
     return FloorCeilingResult(
         frame=frame,
         floor_z=floor_z,
         ceiling_z=ceiling_z,
         inner_footprint_uv=snapped_poly,
+        floor_levels=floor_levels,
+        ceiling_levels=ceiling_levels,
         audit={
             "principal_angle_deg": round(float(np.degrees(frame.angle_rad)), 3),
             "floor_z_local": round(floor_z, 4),
             "ceiling_z_local": round(ceiling_z, 4) if ceiling_z is not None else None,
             "clear_height_m": round(ceiling_z - floor_z, 4) if ceiling_z is not None else None,
+            "floor_levels": [
+                {
+                    "level_id": lv.level_id,
+                    "z_top_local": round(lv.z_top, 4),
+                    "area_m2": round(float(lv.polygon_uv.area), 3),
+                    "point_count": lv.point_count,
+                    "is_primary": lv.is_primary,
+                }
+                for lv in floor_levels
+            ],
+            "ceiling_levels": [
+                {
+                    "level_id": lv.level_id,
+                    "z_bottom_local": round(lv.z_bottom, 4),
+                    "area_m2": round(float(lv.polygon_uv.area), 3),
+                    "point_count": lv.point_count,
+                    "is_primary": lv.is_primary,
+                }
+                for lv in ceiling_levels
+            ],
             "raw_floor_area_m2": round(float(raw_poly.area), 3),
             "snapped_inner_area_m2": round(float(snapped_poly.area), 3),
             "footprint_vertex_count": len(list(snapped_poly.exterior.coords)) - 1,
@@ -419,22 +607,27 @@ def build_floor_and_ceiling_parts(
     fc: FloorCeilingResult,
     outer_shell_uv: Polygon,
     cfg: ArchitectureConfig,
+    *,
+    inner_uv: Polygon | None = None,
+    upper_floor_cutouts: list[tuple[Polygon, float, float]] | None = None,
 ) -> list[MeshPart]:
-    """Extrude watertight hole-free floor and ceiling slabs spanning the exact outer shell (B13/B13a)."""
+    """Extrude watertight floor and ceiling slabs (1F primary + upper mezzanines + secondary ceilings)."""
     parts: list[MeshPart] = []
+    inner_dom = (inner_uv if inner_uv is not None else fc.inner_footprint_uv).buffer(-0.004)
+    cutouts = upper_floor_cutouts or []
 
-    # Floor slab extends from [floor_z - floor_thickness, floor_z], flush beneath exterior walls!
+    # 1. Primary 1F floor slab spanning outer_shell_uv, flush beneath exterior walls
     fv_uv, ft = extrude_polygon_solid(outer_shell_uv, fc.floor_z - cfg.floor_thickness_m, fc.floor_z)
-    fv_xyz = fc.frame.uvz_to_xyz(fv_uv)
     parts.append(
         MeshPart(
             part_id="floor_primary",
             class_id=1,
             role="floor",
-            vertices=fv_xyz,
+            vertices=fc.frame.uvz_to_xyz(fv_uv),
             triangles=ft,
             evidence_kind="measured",
             metadata={
+                "level_id": 0,
                 "z_top_local": round(fc.floor_z, 4),
                 "thickness_m": cfg.floor_thickness_m,
                 "outer_area_m2": round(float(outer_shell_uv.area), 3),
@@ -442,16 +635,67 @@ def build_floor_and_ceiling_parts(
         )
     )
 
+    # 2. Upper mezzanine floor slabs (clipped strictly inside inner_uv and minus stairwells / tall blockers)
+    upper_slab_bands: list[tuple[Polygon, float, float]] = []
+    for lv in fc.floor_levels:
+        if lv.is_primary:
+            continue
+        z_bot = lv.z_top - cfg.floor_thickness_m
+        z_top = lv.z_top
+        slab_poly = lv.polygon_uv.intersection(inner_dom).buffer(0)
+        rel_cuts = [
+            cpoly.buffer(0.004)
+            for cpoly, cz0, cz1 in cutouts
+            if cz0 <= z_top + 0.05 and cz1 >= z_bot - 0.05
+        ]
+        if rel_cuts:
+            slab_poly = slab_poly.difference(unary_union(rel_cuts)).buffer(0)
+        geoms = (
+            list(slab_poly.geoms)
+            if isinstance(slab_poly, MultiPolygon)
+            else ([slab_poly] if isinstance(slab_poly, Polygon) else [])
+        )
+        sub_idx = 0
+        for g in geoms:
+            if g.is_empty or g.area < 0.50:
+                continue
+            g_clean = orient(g.buffer(0), sign=1.0)
+            if isinstance(g_clean, MultiPolygon):
+                g_clean = max(g_clean.geoms, key=lambda x: x.area)
+            try:
+                uv_v, uv_t = extrude_polygon_solid(g_clean, z_bot, z_top)
+            except ValueError:
+                continue
+            pid = f"floor_level_{lv.level_id}" if sub_idx == 0 else f"floor_level_{lv.level_id}_{sub_idx}"
+            parts.append(
+                MeshPart(
+                    part_id=pid,
+                    class_id=1,
+                    role="floor_upper",
+                    vertices=fc.frame.uvz_to_xyz(uv_v),
+                    triangles=uv_t,
+                    evidence_kind="measured",
+                    metadata={
+                        "level_id": lv.level_id,
+                        "z_top_local": round(z_top, 4),
+                        "z_bottom_local": round(z_bot, 4),
+                        "thickness_m": cfg.floor_thickness_m,
+                        "area_m2": round(float(g_clean.area), 3),
+                    },
+                )
+            )
+            upper_slab_bands.append((g_clean, z_bot, z_top))
+            sub_idx += 1
+
+    # 3. Primary roof ceiling slab spanning outer_shell_uv, flush atop exterior walls
     if fc.ceiling_z is not None:
-        # Ceiling slab extends from [ceiling_z, ceiling_z + ceiling_thickness], flush atop exterior walls!
         cv_uv, ct = extrude_polygon_solid(outer_shell_uv, fc.ceiling_z, fc.ceiling_z + cfg.ceiling_thickness_m)
-        cv_xyz = fc.frame.uvz_to_xyz(cv_uv)
         parts.append(
             MeshPart(
                 part_id="ceiling_primary",
                 class_id=11,
                 role="ceiling",
-                vertices=cv_xyz,
+                vertices=fc.frame.uvz_to_xyz(cv_uv),
                 triangles=ct,
                 evidence_kind="measured",
                 metadata={
@@ -461,5 +705,59 @@ def build_floor_and_ceiling_parts(
                 },
             )
         )
+
+    # 4. Secondary lower-wing ceiling slabs (strictly inside inner_uv, disjoint from primary ceiling & upper floors)
+    for clv in fc.ceiling_levels:
+        if clv.is_primary or fc.ceiling_z is None:
+            continue
+        zc_bot = clv.z_bottom
+        zc_top = clv.z_bottom + cfg.ceiling_thickness_m
+        # Skip if overlapping primary ceiling vertically
+        if zc_top >= fc.ceiling_z - 0.02 and zc_bot <= fc.ceiling_z + cfg.ceiling_thickness_m + 0.02:
+            continue
+        cpoly = clv.polygon_uv.intersection(inner_dom).buffer(0)
+        # Subtract any upper floor slab or cutout overlapping vertically
+        block_z = [
+            p.buffer(0.006)
+            for p, zb, zt in (*upper_slab_bands, *cutouts)
+            if zb <= zc_top + 0.02 and zt >= zc_bot - 0.02
+        ]
+        if block_z:
+            cpoly = cpoly.difference(unary_union(block_z)).buffer(0)
+        geoms = (
+            list(cpoly.geoms)
+            if isinstance(cpoly, MultiPolygon)
+            else ([cpoly] if isinstance(cpoly, Polygon) else [])
+        )
+        sub_idx = 0
+        for g in geoms:
+            if g.is_empty or g.area < 0.80:
+                continue
+            g_clean = orient(g.buffer(0), sign=1.0)
+            if isinstance(g_clean, MultiPolygon):
+                g_clean = max(g_clean.geoms, key=lambda x: x.area)
+            try:
+                cv_uv, ct = extrude_polygon_solid(g_clean, zc_bot, zc_top)
+            except ValueError:
+                continue
+            pid = f"ceiling_level_{clv.level_id}" if sub_idx == 0 else f"ceiling_level_{clv.level_id}_{sub_idx}"
+            parts.append(
+                MeshPart(
+                    part_id=pid,
+                    class_id=11,
+                    role="ceiling_secondary",
+                    vertices=fc.frame.uvz_to_xyz(cv_uv),
+                    triangles=ct,
+                    evidence_kind="measured",
+                    metadata={
+                        "level_id": clv.level_id,
+                        "z_bottom_local": round(zc_bot, 4),
+                        "z_top_local": round(zc_top, 4),
+                        "thickness_m": cfg.ceiling_thickness_m,
+                        "area_m2": round(float(g_clean.area), 3),
+                    },
+                )
+            )
+            sub_idx += 1
 
     return parts

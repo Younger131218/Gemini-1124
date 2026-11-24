@@ -50,7 +50,7 @@ def render_arch_review_png(
     # Panel 1: Room-aligned UV Top-Down Plan (structural point cloud vs outer/inner shell + openings + columns)
     ax = axes[0, 0]
     ax.set_title("1. Top-Down Plan (Room UV Frame): Cloud vs Shell / Columns / Openings")
-    for cid in (1, 2, 4, 5, 6):
+    for cid in (1, 2, 4, 5, 6, 13, 14):
         idx = np.flatnonzero(wl == cid)
         if len(idx) == 0:
             continue
@@ -64,7 +64,7 @@ def render_arch_review_png(
     ax.plot(ix, iy, color="black", lw=2.0, label="inner shell")
     ax.plot(ox, oy, color="navy", lw=1.6, ls="--", label="outer shell")
 
-    # Draw openings & columns in UV
+    # Draw openings, columns, stairs & railings in UV
     for w in shell.walls:
         for op in w.openings:
             p0 = w.p0_xy + w.tangent_xy * op.s_min
@@ -73,11 +73,13 @@ def render_arch_review_png(
             ax.plot([p0[0], p1[0]], [p0[1], p1[1]], color=col, lw=4.5, solid_capstyle="butt")
 
     for p in parts:
-        if p.class_id == 4:
+        if p.class_id in (4, 13, 14):
             puv = fc.frame.pts_to_uvz(p.vertices)
             u0, v0 = puv[:, 0].min(), puv[:, 1].min()
             u1, v1 = puv[:, 0].max(), puv[:, 1].max()
-            ax.plot([u0, u1, u1, u0, u0], [v0, v0, v1, v1, v0], color="magenta", lw=1.8)
+            col = "magenta" if p.class_id == 4 else ("#6d4c41" if p.class_id == 13 else "#00acc1")
+            lw = 1.8 if p.class_id in (4, 13) else 1.2
+            ax.plot([u0, u1, u1, u0, u0], [v0, v0, v1, v1, v0], color=col, lw=lw)
 
     ax.set_aspect("equal", "box")
     ax.set_xlabel("u (m)")
@@ -88,7 +90,7 @@ def render_arch_review_png(
     # Panel 2: Side Elevation U-Z (floor, ceiling, walls, windows, doors, beams)
     ax = axes[0, 1]
     ax.set_title("2. Elevation U-Z: Cloud vs Reconstructed Structural Z-Bands")
-    for cid in (1, 2, 3, 5, 6, 11):
+    for cid in (1, 2, 3, 5, 6, 11, 13, 14):
         idx = np.flatnonzero(wl == cid)
         if len(idx) == 0:
             continue
@@ -96,9 +98,24 @@ def render_arch_review_png(
             idx = rng.choice(idx, size=6000, replace=False)
         rgba = palette.get(str(cid), {}).get("rgba", [0.5, 0.5, 0.5, 1.0])
         ax.scatter(uvz[idx, 0], uvz[idx, 2], s=0.5, alpha=0.28, color=rgba[:3], label=f"cls {cid}")
-    ax.axhline(fc.floor_z, color="red", lw=1.5, ls="-", label=f"floor_z={fc.floor_z:.2f}")
-    if fc.ceiling_z is not None:
+    for flv in fc.floor_levels or []:
+        lbl = f"floor_L{flv.level_id}={flv.z_top:.2f}"
+        ax.axhline(flv.z_top, color="red", lw=1.5 if flv.is_primary else 1.1, ls="-" if flv.is_primary else "--", label=lbl)
+    if not fc.floor_levels:
+        ax.axhline(fc.floor_z, color="red", lw=1.5, ls="-", label=f"floor_z={fc.floor_z:.2f}")
+    for clv in fc.ceiling_levels or []:
+        lbl = f"ceil_L{clv.level_id}={clv.z_bottom:.2f}"
+        ax.axhline(clv.z_bottom, color="blue", lw=1.5 if clv.is_primary else 1.1, ls="-" if clv.is_primary else "--", label=lbl)
+    if not fc.ceiling_levels and fc.ceiling_z is not None:
         ax.axhline(fc.ceiling_z, color="blue", lw=1.5, ls="-", label=f"ceil_z={fc.ceiling_z:.2f}")
+    # Overlay reconstructed beam & stair U-Z bounds
+    for p in parts:
+        if p.class_id in (3, 13):
+            puv = fc.frame.pts_to_uvz(p.vertices)
+            u0, z0 = puv[:, 0].min(), puv[:, 2].min()
+            u1, z1 = puv[:, 0].max(), puv[:, 2].max()
+            col = "#2e7d32" if p.class_id == 3 else "#6d4c41"
+            ax.plot([u0, u1, u1, u0, u0], [z0, z0, z1, z1, z0], color=col, lw=1.0, alpha=0.75)
     ax.set_xlabel("u (m)")
     ax.set_ylabel("z (m)")
     ax.legend(loc="lower right", fontsize=7, markerscale=6)

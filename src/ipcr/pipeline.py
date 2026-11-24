@@ -11,7 +11,7 @@ from ipcr import __version__
 from ipcr.architecture.beams_columns import build_beam_parts, build_column_parts
 from ipcr.architecture.frame_floors import analyze_floor_and_ceiling, build_floor_and_ceiling_parts
 from ipcr.architecture.openings import build_opening_parts, detect_and_bind_openings
-from ipcr.architecture.stairs_railings import evaluate_stairs_and_railings
+from ipcr.architecture.stairs_railings import build_stairs_and_railings
 from ipcr.architecture.walls_shell import (
     build_exterior_wall_parts,
     build_interior_wall_parts,
@@ -68,28 +68,44 @@ def run_arch_pipeline(
         fc, shell, cloud.points_local, wl_state.work_labels, pcfg.architecture
     )
 
-    # 5. Extrude watertight architectural solids
-    parts: list[MeshPart] = []
-    parts.extend(build_floor_and_ceiling_parts(fc, shell.outer_uv, pcfg.architecture))
-    parts.extend(build_exterior_wall_parts(fc, shell))
-    parts.extend(build_opening_parts(fc, shell, openings, pcfg.architecture))
-
-    int_wall_parts, int_wall_polys_uv, int_wall_audit = build_interior_wall_parts(
+    # 5. Extrude watertight architectural solids in strict collision-free DAG order:
+    #    interior_walls -> columns -> stairs/railings -> beams -> floor/ceiling slabs (with stairwell/column cutouts)
+    int_wall_parts, int_wall_polys_uv, int_wall_cutouts, int_wall_audit = build_interior_wall_parts(
         fc, shell, cloud.points_local, wl_state.work_labels, pcfg.architecture
     )
-    parts.extend(int_wall_parts)
-
-    col_parts, col_polys_uv, col_audit = build_column_parts(
+    col_parts, col_polys_uv, col_cutouts, col_audit = build_column_parts(
         fc, shell, int_wall_polys_uv, cloud.points_local, wl_state.work_labels, pcfg.architecture
     )
-    parts.extend(col_parts)
-
-    beam_parts, beam_audit = build_beam_parts(
-        fc, shell, col_polys_uv, int_wall_polys_uv, cloud.points_local, wl_state.work_labels, pcfg.architecture
+    stair_parts, stair_well_cutouts, stair_beam_blockers, stair_audit = build_stairs_and_railings(
+        fc, shell, int_wall_polys_uv, col_polys_uv, cloud.points_local, wl_state.work_labels, pcfg.architecture
     )
-    parts.extend(beam_parts)
+    beam_parts, beam_audit = build_beam_parts(
+        fc,
+        shell,
+        col_polys_uv,
+        int_wall_polys_uv,
+        cloud.points_local,
+        wl_state.work_labels,
+        pcfg.architecture,
+        extra_blocker_bands=stair_beam_blockers,
+    )
 
-    stair_parts, stair_audit = evaluate_stairs_and_railings(cloud.points_local, wl_state.work_labels)
+    upper_floor_cutouts = [*stair_well_cutouts, *col_cutouts, *int_wall_cutouts]
+    parts: list[MeshPart] = []
+    parts.extend(
+        build_floor_and_ceiling_parts(
+            fc,
+            shell.outer_uv,
+            pcfg.architecture,
+            inner_uv=shell.inner_uv,
+            upper_floor_cutouts=upper_floor_cutouts,
+        )
+    )
+    parts.extend(build_exterior_wall_parts(fc, shell))
+    parts.extend(build_opening_parts(fc, shell, openings, pcfg.architecture))
+    parts.extend(int_wall_parts)
+    parts.extend(col_parts)
+    parts.extend(beam_parts)
     parts.extend(stair_parts)
 
     scene = SceneBuildResult(
@@ -125,6 +141,10 @@ def run_arch_pipeline(
     )
     rel_audit = audit_part_pair_intersections(parts, eps=1e-3)
     arch_classes = [1, 2, 3, 4, 5, 6, 11]
+    if any(p.class_id == 13 for p in parts) or stair_audit.get("stair_points_after_working_labels", 0) > 0:
+        arch_classes.append(13)
+    if any(p.class_id == 14 for p in parts) or stair_audit.get("railing_points_after_working_labels", 0) > 0:
+        arch_classes.append(14)
     cloud_metrics = compute_bidirectional_class_metrics(
         cloud.points_local, wl_state.work_labels, parts, target_classes=arch_classes, cfg=pcfg.validation
     )

@@ -57,41 +57,103 @@ def _estimate_primary_floor_z(points: np.ndarray, labels: np.ndarray) -> tuple[f
 
 
 def _voxel_connected_components_3d(points: np.ndarray, voxel_size: float) -> list[np.ndarray]:
-    """Deterministic 26-connected voxel clustering returning arrays of point indices."""
-    if len(points) == 0:
+    """Fast vectorized 26-connected voxel clustering returning arrays of point indices."""
+    n_pts = len(points)
+    if n_pts == 0:
         return []
     coords = np.floor(points / voxel_size).astype(np.int64)
-    voxel_to_pts: dict[tuple[int, int, int], list[int]] = {}
-    for idx, c in enumerate(coords):
-        key = (int(c[0]), int(c[1]), int(c[2]))
-        voxel_to_pts.setdefault(key, []).append(idx)
+    # Shift to non-negative ints and pack into single int64 key for O(N log N) C-level grouping
+    cmin = coords.min(axis=0)
+    shifted = coords - cmin
+    spans = shifted.max(axis=0) + 2
+    stride_y = int(spans[2])
+    stride_x = int(spans[1]) * stride_y
 
-    visited: set[tuple[int, int, int]] = set()
-    components: list[np.ndarray] = []
-    offsets = [
-        (dx, dy, dz)
-        for dx in (-1, 0, 1)
-        for dy in (-1, 0, 1)
-        for dz in (-1, 0, 1)
-        if not (dx == 0 and dy == 0 and dz == 0)
-    ]
+    if stride_x * int(spans[0]) < (1 << 60):
+        keys = shifted[:, 0] * stride_x + shifted[:, 1] * stride_y + shifted[:, 2]
+        order = np.argsort(keys, kind="mergesort")
+        sorted_keys = keys[order]
+        change = np.empty(n_pts, dtype=bool)
+        change[0] = True
+        change[1:] = sorted_keys[1:] != sorted_keys[:-1]
+        group_starts = np.flatnonzero(change)
+        uniq_keys = sorted_keys[group_starts]
+        # Decode unique voxel coords
+        uz = uniq_keys % stride_y
+        rem = uniq_keys // stride_y
+        uy = rem % int(spans[1])
+        ux = rem // int(spans[1])
+        uniq_coords = np.column_stack([ux, uy, uz])
+        key_to_gid = {int(k): g for g, k in enumerate(uniq_keys.tolist())}
 
-    for start in voxel_to_pts:
-        if start in visited:
+        # Precompute neighbor key offsets
+        nb_offsets = [
+            dx * stride_x + dy * stride_y + dz
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            for dz in (-1, 0, 1)
+            if not (dx == 0 and dy == 0 and dz == 0)
+        ]
+
+        n_vox = len(uniq_keys)
+        visited = np.zeros(n_vox, dtype=bool)
+        group_ends = np.append(group_starts[1:], n_pts)
+        components: list[np.ndarray] = []
+
+        for start_g in range(n_vox):
+            if visited[start_g]:
+                continue
+            q: deque[int] = deque([start_g])
+            visited[start_g] = True
+            comp_groups: list[int] = []
+            while q:
+                g = q.popleft()
+                comp_groups.append(g)
+                k0 = int(uniq_keys[g])
+                x0, y0, z0 = int(uniq_coords[g, 0]), int(uniq_coords[g, 1]), int(uniq_coords[g, 2])
+                for off in nb_offsets:
+                    nk = k0 + off
+                    ng = key_to_gid.get(nk)
+                    if ng is not None and not visited[ng]:
+                        # Guard wrap-around across axis boundary
+                        if (
+                            abs(int(uniq_coords[ng, 0]) - x0) <= 1
+                            and abs(int(uniq_coords[ng, 1]) - y0) <= 1
+                            and abs(int(uniq_coords[ng, 2]) - z0) <= 1
+                        ):
+                            visited[ng] = True
+                            q.append(ng)
+            slices = [order[group_starts[g] : group_ends[g]] for g in comp_groups]
+            components.append(np.concatenate(slices).astype(np.int64))
+        components.sort(key=len, reverse=True)
+        return components
+
+    # Fallback for astronomical coordinate spans
+    uniq, inv = np.unique(coords, axis=0, return_inverse=True)
+    order = np.argsort(inv, kind="mergesort")
+    counts = np.bincount(inv)
+    starts = np.cumsum(np.concatenate(([0], counts[:-1])))
+    ends = starts + counts
+    coord_to_gid = {(int(c[0]), int(c[1]), int(c[2])): i for i, c in enumerate(uniq)}
+    visited = np.zeros(len(uniq), dtype=bool)
+    offsets = [(dx, dy, dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1) if dx or dy or dz]
+    components = []
+    for sg in range(len(uniq)):
+        if visited[sg]:
             continue
-        q: deque[tuple[int, int, int]] = deque([start])
-        visited.add(start)
-        comp_indices: list[int] = []
+        q = deque([sg])
+        visited[sg] = True
+        cgroups: list[int] = []
         while q:
-            cur = q.popleft()
-            comp_indices.extend(voxel_to_pts[cur])
-            cx, cy, cz = cur
+            g = q.popleft()
+            cgroups.append(g)
+            cx, cy, cz = int(uniq[g, 0]), int(uniq[g, 1]), int(uniq[g, 2])
             for dx, dy, dz in offsets:
-                nb = (cx + dx, cy + dy, cz + dz)
-                if nb in voxel_to_pts and nb not in visited:
-                    visited.add(nb)
-                    q.append(nb)
-        components.append(np.asarray(comp_indices, dtype=np.int64))
+                ng = coord_to_gid.get((cx + dx, cy + dy, cz + dz))
+                if ng is not None and not visited[ng]:
+                    visited[ng] = True
+                    q.append(ng)
+        components.append(np.concatenate([order[starts[g] : ends[g]] for g in cgroups]).astype(np.int64))
     components.sort(key=len, reverse=True)
     return components
 
@@ -179,9 +241,15 @@ def _apply_wl_a_ceiling(
         bins = np.array([zmin - 0.03, zmax + 0.03])
 
     remaining_mask = np.ones(len(high_idx), dtype=bool)
-    min_area = max(cfg.ceiling_min_area_m2, floor_area * cfg.ceiling_min_floor_area_ratio)
+    # Primary ceiling uses cfg.ceiling_min_floor_area_ratio; secondary wing ceilings (e.g. lower entrance)
+    # require >= 2.0 m^2 and >= 4% of floor area so low-ceiling corridors are also cleanly promoted.
+    primary_min_area = max(cfg.ceiling_min_area_m2, floor_area * cfg.ceiling_min_floor_area_ratio)
+    secondary_min_area = max(cfg.ceiling_min_area_m2, floor_area * 0.04)
+    promoted_slabs = 0
+    primary_xy_cells: set[tuple[int, int]] = set()
+    primary_z: float | None = None
 
-    for _ in range(4):
+    for _ in range(5):
         cand_local = np.flatnonzero(remaining_mask)
         if len(cand_local) < 200:
             break
@@ -214,11 +282,29 @@ def _apply_wl_a_ceiling(
         area = float(len(cells)) * (vox * vox)
         remaining_mask[inlier_local] = False
 
+        min_area = primary_min_area if promoted_slabs == 0 else secondary_min_area
         if area < min_area:
             continue
 
+        coarse_cells = {
+            (int(c[0]), int(c[1]))
+            for c in np.unique(np.floor(inlier_pts[:, :2] / 0.25).astype(np.int64), axis=0)
+        }
+        if promoted_slabs == 0:
+            primary_xy_cells = coarse_cells
+            primary_z = float(centroid[2])
+        else:
+            # Secondary wing ceiling must be a genuine lower-wing ceiling (>=0.80m below primary roof,
+            # never rooftop/attic scan bleed floating above the primary ceiling) and mostly outside primary XY.
+            outside_ratio = len(coarse_cells - primary_xy_cells) / max(len(coarse_cells), 1)
+            if primary_z is not None and (float(centroid[2]) > primary_z - 0.80):
+                continue
+            if outside_ratio < 0.50:
+                continue
+
         work_labels[inlier_global] = 11
         rule_ids[inlier_global] = RULE_WL_A_CEILING_0_TO_11
+        promoted_slabs += 1
         mn, mx = _bbox_summary(inlier_pts)
         adjustments.append(
             WorkingLabelAdjustment(

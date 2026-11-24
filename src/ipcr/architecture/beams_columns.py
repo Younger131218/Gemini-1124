@@ -18,6 +18,48 @@ from ipcr.types import MeshPart
 from ipcr.working_labels import _voxel_connected_components_3d
 
 
+def _lowest_overhead_slab_bottom(
+    poly_uv: Polygon,
+    z_ref_bot: float,
+    fc: FloorCeilingResult,
+    cfg: ArchitectureConfig,
+    fallback_top: float,
+) -> float:
+    """Find the lowest overhead slab bottom (upper floor bottom or ceiling bottom) above poly_uv."""
+    candidates: list[float] = []
+    if fc.ceiling_z is not None and fc.ceiling_z > z_ref_bot + 0.15:
+        candidates.append(fc.ceiling_z)
+    for clv in fc.ceiling_levels:
+        if clv.z_bottom > z_ref_bot + 0.15 and clv.polygon_uv.intersects(poly_uv):
+            inter = clv.polygon_uv.intersection(poly_uv)
+            if inter.area >= min(poly_uv.area * 0.25, 0.15):
+                candidates.append(clv.z_bottom)
+    for flv in fc.floor_levels:
+        if flv.is_primary:
+            continue
+        slab_bot = flv.z_top - cfg.floor_thickness_m
+        if slab_bot > z_ref_bot + 0.15 and flv.polygon_uv.intersects(poly_uv):
+            inter = flv.polygon_uv.intersection(poly_uv)
+            if inter.area >= min(poly_uv.area * 0.20, 0.10):
+                candidates.append(slab_bot)
+    return min(candidates) if candidates else fallback_top
+
+
+def _supporting_floor_top(
+    poly_uv: Polygon,
+    z_meas_lo: float,
+    fc: FloorCeilingResult,
+) -> float:
+    """Snap a structural base to the closest floor level beneath it (within 0.45m), else floor_z."""
+    best = fc.floor_z
+    for flv in fc.floor_levels:
+        if flv.z_top <= z_meas_lo + 0.30:
+            if flv.is_primary or flv.polygon_uv.intersects(poly_uv):
+                if abs(z_meas_lo - flv.z_top) <= 0.45 and flv.z_top > best:
+                    best = flv.z_top
+    return best
+
+
 def build_column_parts(
     fc: FloorCeilingResult,
     shell: ExteriorShellPlan,
@@ -25,23 +67,28 @@ def build_column_parts(
     points_local: np.ndarray,
     work_labels: np.ndarray,
     cfg: ArchitectureConfig,
-) -> tuple[list[MeshPart], list[Polygon], dict[str, Any]]:
-    """Build closed column solids clipped strictly inside inner_uv minus interior walls."""
+) -> tuple[list[MeshPart], list[Polygon], list[tuple[Polygon, float, float]], dict[str, Any]]:
+    """Build closed column solids clipped strictly inside inner_uv minus interior walls.
+
+    Returns (parts, col_polys_uv, slab_cutouts, audit).
+    """
     uvz = fc.frame.pts_to_uvz(points_local)
     col_pts = uvz[work_labels == 4]
     if len(col_pts) < cfg.column_min_points:
-        return [], [], {"emitted_count": 0, "rejected": []}
+        return [], [], [], {"emitted_count": 0, "rejected": []}
 
     z_top_limit = fc.ceiling_z if fc.ceiling_z is not None else float(np.percentile(col_pts[:, 2], 98))
     comps = _voxel_connected_components_3d(col_pts, voxel_size=0.12)
     parts: list[MeshPart] = []
     col_polys_uv: list[Polygon] = []
+    slab_cutouts: list[tuple[Polygon, float, float]] = []
     rejected: list[dict[str, Any]] = []
     accepted_log: list[dict[str, Any]] = []
 
-    allowed = shell.inner_uv.buffer(-0.003)
+    allowed = shell.inner_uv.buffer(-0.004)
     if interior_wall_polys_uv:
-        allowed = allowed.difference(unary_union([p.buffer(0.003) for p in interior_wall_polys_uv]))
+        allowed = allowed.difference(unary_union([p.buffer(0.004) for p in interior_wall_polys_uv]))
+    placed_union: Polygon | MultiPolygon | None = None
 
     for idx, comp in enumerate(comps):
         if len(comp) < cfg.column_min_points:
@@ -63,6 +110,9 @@ def build_column_parts(
 
         raw_rect = box(u_lo, v_lo, u_hi, v_hi)
         clipped = raw_rect.intersection(allowed)
+        if placed_union is not None and not placed_union.is_empty:
+            clipped = clipped.difference(placed_union.buffer(0.004))
+        clipped = clipped.buffer(0)
         if isinstance(clipped, MultiPolygon):
             clipped = max(clipped.geoms, key=lambda g: g.area)
         if clipped.is_empty or not isinstance(clipped, Polygon):
@@ -80,12 +130,24 @@ def build_column_parts(
             })
             continue
 
-        col_z_min = fc.floor_z + 0.001
-        col_z_max = z_top_limit - 0.001 if (z_top_limit - z_hi) <= 0.60 else min(z_hi, z_top_limit - 0.001)
+        base_z = _supporting_floor_top(clipped, z_lo, fc)
+        col_z_min = base_z + 0.002
+
+        # Determine local overhead slab (upper mezzanine or lower wing ceiling)
+        local_overhead = _lowest_overhead_slab_bottom(clipped, col_z_min, fc, cfg, z_top_limit)
+        # Check if the column genuinely rises through the local overhead slab (e.g. full-height column)
+        frac_above_local = float(np.mean(sub[:, 2] > local_overhead + cfg.floor_thickness_m + 0.25))
+        if local_overhead < z_top_limit - 0.30 and frac_above_local < 0.08:
+            # Lower-storey column supporting the mezzanine/lower ceiling: cap cleanly beneath it!
+            col_z_max = local_overhead - 0.002 if (local_overhead - z_hi) <= 0.65 else min(z_hi, local_overhead - 0.002)
+        else:
+            # Full-height column rising to main ceiling: register as slab cutout for any upper floor it pierces
+            col_z_max = z_top_limit - 0.002 if (z_top_limit - z_hi) <= 0.65 else min(z_hi, z_top_limit - 0.002)
+
         if col_z_max <= col_z_min + 0.20:
             continue
 
-        poly_clean = orient(Polygon(clipped.exterior.coords).buffer(0), sign=1.0)
+        poly_clean = orient(clipped.buffer(0), sign=1.0)
         if isinstance(poly_clean, MultiPolygon):
             poly_clean = max(poly_clean.geoms, key=lambda g: g.area)
         v_uv, tri = extrude_polygon_solid(poly_clean, col_z_min, col_z_max)
@@ -106,9 +168,11 @@ def build_column_parts(
             )
         )
         col_polys_uv.append(poly_clean)
+        slab_cutouts.append((poly_clean, col_z_min, col_z_max))
+        placed_union = poly_clean if placed_union is None else unary_union([placed_union, poly_clean])
         accepted_log.append(parts[-1].metadata | {"part_id": pid})
 
-    return parts, col_polys_uv, {
+    return parts, col_polys_uv, slab_cutouts, {
         "emitted_count": len(parts),
         "columns": accepted_log,
         "rejected": rejected,
@@ -116,16 +180,12 @@ def build_column_parts(
 
 
 def _greedy_maximal_rectangles(mask: np.ndarray, min_cells: int = 4) -> list[tuple[int, int, int, int]]:
-    """Decompose an arbitrary 2D binary mask (even complex cross/grid beams!) into disjoint axis-aligned rectangles.
-
-    Returns list of (r0, r1, c0, c1) half-open index rectangles with zero overlap and zero hole-triangulation failures!
-    """
+    """Decompose an arbitrary 2D binary mask (even complex cross/grid beams!) into disjoint axis-aligned rectangles."""
     rem = mask.copy()
     rects: list[tuple[int, int, int, int]] = []
     nrows, ncols = rem.shape
 
     while True:
-        # Largest rectangle in binary matrix via histogram stack algorithm — O(R*C)
         heights = np.zeros(ncols, dtype=np.int32)
         best_area = 0
         best_rect = (0, 0, 0, 0)
@@ -162,8 +222,10 @@ def build_beam_parts(
     points_local: np.ndarray,
     work_labels: np.ndarray,
     cfg: ArchitectureConfig,
+    *,
+    extra_blocker_bands: list[tuple[Polygon, float, float]] | None = None,
 ) -> tuple[list[MeshPart], dict[str, Any]]:
-    """Build crisp orthogonal overhead beam solids via maximal-rectangle decomposition (handles cross/grid beams!)."""
+    """Build crisp orthogonal overhead beam solids with local-storey z_top and hole-preserving clipping."""
     uvz = fc.frame.pts_to_uvz(points_local)
     beam_pts = uvz[work_labels == 3]
     if len(beam_pts) < cfg.beam_min_points:
@@ -197,10 +259,11 @@ def build_beam_parts(
     if not rects_idx:
         return [], {"emitted_count": 0, "reason": "no_beam_rectangles"}
 
-    allowed_domain = shell.inner_uv.buffer(-0.003)
+    allowed_domain = shell.inner_uv.buffer(-0.005)
     blockers = [*column_polys_uv, *interior_wall_polys_uv]
     if blockers:
-        allowed_domain = allowed_domain.difference(unary_union([p.buffer(0.003) for p in blockers]))
+        allowed_domain = allowed_domain.difference(unary_union([p.buffer(0.006) for p in blockers])).buffer(0)
+    z_bands = extra_blocker_bands or []
 
     u_edges = minx + np.arange(nu + 1, dtype=np.float64) * cell
     v_edges = miny + np.arange(nv + 1, dtype=np.float64) * cell
@@ -213,25 +276,64 @@ def build_beam_parts(
         rpts = overhead[in_rect]
         if len(rpts) < 80:
             continue
+
+        rect_poly = box(float(u_edges[r0]), float(v_edges[c0]), float(u_edges[r1]), float(v_edges[c1]))
         z_bot = float(np.percentile(rpts[:, 2], 8))
-        z_top = z_ceil - 0.001
+        z_meas_top = float(np.percentile(rpts[:, 2], 96))
+
+        # Snap beam top to the LOCAL overhead slab (mezzanine floor bottom or lower/main ceiling bottom)!
+        overhead_bot = _lowest_overhead_slab_bottom(rect_poly, z_bot, fc, cfg, z_ceil)
+        if overhead_bot - z_meas_top <= 0.55:
+            z_top = overhead_bot - 0.003
+        else:
+            # Beam sits well below the overhead slab (e.g. exposed lower-storey beam without mezzanine points directly above)
+            z_top = min(z_meas_top, overhead_bot - 0.003)
+
+        # Also avoid colliding with any upper floor slab or secondary ceiling vertically!
+        for flv in fc.floor_levels:
+            if flv.is_primary:
+                continue
+            slab_bot = flv.z_top - cfg.floor_thickness_m
+            if flv.polygon_uv.intersects(rect_poly) and z_bot < flv.z_top and z_top > slab_bot - 0.003:
+                if z_bot < slab_bot - 0.08:
+                    z_top = min(z_top, slab_bot - 0.003)
+                else:
+                    z_bot = max(z_bot, flv.z_top + 0.003)
+
+        for clv in fc.ceiling_levels:
+            if clv.is_primary:
+                continue
+            c_top = clv.z_bottom + cfg.ceiling_thickness_m
+            if clv.polygon_uv.intersects(rect_poly) and z_bot < c_top and z_top > clv.z_bottom - 0.003:
+                if z_bot < clv.z_bottom - 0.08:
+                    z_top = min(z_top, clv.z_bottom - 0.003)
+                else:
+                    z_bot = max(z_bot, c_top + 0.003)
+
         if z_top - z_bot < cfg.beam_min_height_m:
             continue
 
-        rect_poly = box(float(u_edges[r0]), float(v_edges[c0]), float(u_edges[r1]), float(v_edges[c1]))
         clipped = rect_poly.intersection(allowed_domain)
+        ov_bands = [p.buffer(0.008) for p, bz0, bz1 in z_bands if bz0 <= z_top + 0.02 and bz1 >= z_bot - 0.02]
+        if ov_bands:
+            clipped = clipped.difference(unary_union(ov_bands))
         if placed_union is not None and not placed_union.is_empty:
-            clipped = clipped.difference(placed_union)
+            clipped = clipped.difference(placed_union.buffer(0.002))
         clipped = clipped.buffer(0)
 
-        geoms = list(clipped.geoms) if isinstance(clipped, MultiPolygon) else ([clipped] if isinstance(clipped, Polygon) else [])
+        geoms = (
+            list(clipped.geoms)
+            if isinstance(clipped, MultiPolygon)
+            else ([clipped] if isinstance(clipped, Polygon) else [])
+        )
         for g in geoms:
             if g.is_empty or g.area < 0.04:
                 continue
-            g_clean = orient(Polygon(g.exterior.coords).buffer(0), sign=1.0)
+            # CRITICAL: Preserve g.interiors (holes cut out around interior columns!)
+            g_clean = orient(g.buffer(0), sign=1.0)
             if isinstance(g_clean, MultiPolygon):
                 g_clean = max(g_clean.geoms, key=lambda x: x.area)
-            if g_clean.area < 0.04:
+            if g_clean.is_empty or g_clean.area < 0.04:
                 continue
             try:
                 v_uv, tri = extrude_polygon_solid(g_clean, z_bot, z_top)
