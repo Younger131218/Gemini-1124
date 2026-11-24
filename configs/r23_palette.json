@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "template_reference": "office_candidate_r23_component_r19_global_zup/yup.glb",
+  "roughness_factor": 0.45,
+  "metallic_factor": 0.0,
+  "classes": {
+    "1":  {"name": "地面",       "legacy_slot_name": "地板",     "rgba": [0.9, 0.135, 0.135, 1.0]},
+    "2":  {"name": "墙",         "legacy_slot_name": "墙壁",     "rgba": [0.135, 0.358224, 0.9, 1.0]},
+    "3":  {"name": "梁",         "legacy_slot_name": "梁",       "rgba": [0.581448, 0.9, 0.135, 1.0]},
+    "4":  {"name": "柱",         "legacy_slot_name": "柱",       "rgba": [0.9, 0.135, 0.804672, 1.0]},
+    "5":  {"name": "窗",         "legacy_slot_name": "窗",       "rgba": [0.135, 0.9, 0.772104, 1.0]},
+    "6":  {"name": "门",         "legacy_slot_name": "门",       "rgba": [0.9, 0.54888, 0.135, 1.0]},
+    "7":  {"name": "椅子",       "legacy_slot_name": "凳子",     "rgba": [0.325656, 0.135, 0.9, 1.0]},
+    "8":  {"name": "桌子",       "legacy_slot_name": "桌子",     "rgba": [0.167568, 0.9, 0.135, 1.0]},
+    "9":  {"name": "柜子",       "legacy_slot_name": "柜子",     "rgba": [0.9, 0.135, 0.390792, 1.0]},
+    "10": {"name": "沙发",       "legacy_slot_name": "沙发",     "rgba": [0.75, 0.25, 0.65, 1.0]},
+    "11": {"name": "天花板",     "legacy_slot_name": "天花板",   "rgba": [0.135, 0.614016, 0.9, 1.0]},
+    "12": {"name": "杂物",       "legacy_slot_name": "杂物",     "rgba": [0.83724, 0.9, 0.135, 1.0]},
+    "13": {"name": "楼梯",       "legacy_slot_name": "楼梯",     "rgba": [0.85, 0.45, 0.2, 1.0]},
+    "14": {"name": "栏杆及扶手", "legacy_slot_name": "栏杆及扶手", "rgba": [0.2, 0.75, 0.55, 1.0]}
+  }
+}

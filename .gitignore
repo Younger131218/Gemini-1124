@@ -1,0 +1,50 @@
+# Python & Virtualenv
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+build/
+
+# Point clouds, 3D models, binaries & private assets (NEVER commit to Git)
+*.las
+*.laz
+*.ply
+*.pcd
+*.e57
+*.skp
+*.glb
+*.gltf
+*.bin
+*.obj
+*.mtl
+*.pkl
+*.npz
+*.npy
+*.dpc
+
+# Local runs, outputs, screenshots & machine-specific configs
+runs/
+outputs/
+*.local.json
+*.png
+*.jpg
+*.jpeg
+*.log
+*.zip
+*.rar
+*.exe
+*.dll
+*.so
+*.pyd
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,378 @@
+{
+  "schema_version": 1,
+  "glb_count": 16,
+  "skipped_non_glb": [
+    "楼梯扶手/Marble+staircase+wooden+handrail+without+glass.skp"
+  ],
+  "notes": "Sanitized read-only metadata catalog. Binary GLB assets remain local and are never committed to Git.",
+  "assets": [
+    {
+      "asset_id": "lowpoly_office_chair",
+      "relative_path": "凳子椅子/lowpoly_office_chair.glb",
+      "class_id": 7,
+      "class_name": "椅子",
+      "sha256": "49bf75b9aaeb455482eb22ef6b6b15e3fcbe7d3f90577acb545e88cb5363a4ae",
+      "vertex_count": 10080,
+      "triangle_count": 5040,
+      "baked_raw_extent_xyz": [
+        0.7418,
+        1.1082,
+        0.8423
+      ],
+      "inferred_unit": "m",
+      "scale_to_meters": 1.0,
+      "normalized_extent_xyz_m": [
+        0.7418,
+        1.1082,
+        0.8423
+      ],
+      "up_axis": "Y",
+      "status": "audited"
+    },
+    {
+      "asset_id": "office_chair",
+      "relative_path": "凳子椅子/office_chair.glb",
+      "class_id": 7,
+      "class_name": "椅子",
+      "sha256": "dbcd78db3f3d99c305fbb7659c45e0525fd944af28a3834a6cbafb085ec3499f",
+      "vertex_count": 22550,
+      "triangle_count": 30813,
+      "baked_raw_extent_xyz": [
+        63.5103,
+        100.8585,
+        66.6869
+      ],
+      "inferred_unit": "cm",
+      "scale_to_meters": 0.01,
+      "normalized_extent_xyz_m": [
+        0.6351,
+        1.0086,
+        0.6669
+      ],
+      "up_axis": "Y",
+      "status": "audited"
+    },
+    {
+      "asset_id": "office_chair_modern",
+      "relative_path": "凳子椅子/office_chair_modern.glb",
+      "class_id": 7,
+      "class_name": "椅子",
+      "sha256": "f2ddc4aca423ebed549b21f186ec53461a45416a0fde869eef82b46997b79cc0",
+      "vertex_count": 1512,
+      "triangle_count": 1234,
+      "baked_raw_extent_xyz": [
+        0.7204,
+        0.9662,
+        0.7597
+      ],
+      "inferred_unit": "m",
+      "scale_to_meters": 1.0,
+      "normalized_extent_xyz_m": [
+        0.7204,
+        0.9662,
+        0.7597
+      ],
+      "up_axis": "Y",
+      "status": "audited"
+    },
+    {
+      "asset_id": "armored_cabinet",
+      "relative_path": "柜子/armored_cabinet.glb",
+      "class_id": 9,
+      "class_name": "柜子",
+      "sha256": "8338b314c1605938f968e31776db7fcfaa057002bfab630ce90db2250c8e3535",
+      "vertex_count": 5694,
+      "triangle_count": 4579,
+      "baked_raw_extent_xyz": [
+        1.1305,
+        1.993,
+        0.575
+      ],
+      "inferred_unit": "m",
+      "scale_to_meters": 1.0,
+      "normalized_extent_xyz_m": [
+        1.1305,
+        1.993,
+        0.575
+      ],
+      "up_axis": "Y",
+      "status": "audited"
+    },
+    {
+      "asset_id": "armored_cabinet2",
+      "relative_path": "柜子/armored_cabinet2.glb",
+      "class_id": 9,
+      "class_name": "柜子",
+      "sha256": "425ac3a30939e23c862aa8a1df3bb08100a20a05e79f9c7b551a8fcb3b3b60bc",
+      "vertex_count": 5890,
+      "triangle_count": 6312,
+      "baked_raw_extent_xyz": [
+        0.44,
+        1.8,
+        0.97
+      ],
+      "inferred_unit": "m",
+      "scale_to_meters": 1.0,
+      "normalized_extent_xyz_m": [
+        0.44,
+        1.8,
+        0.97
+      ],
+      "up_axis": "Y",
+      "status": "audited"
+    },
+    {
+      "asset_id": "metal_filing_cabinet",
+      "relative_path": "柜子/metal_filing_cabinet.glb",
+      "class_id": 9,
+      "class_name": "柜子",
+      "sha256": "7f692cb56755a29c1b799a81a752553cc78cae73dafc160d7bf59e09ba37f38d",
+      "vertex_count": 44049,
+      "triangle_count": 58006,
+      "baked_raw_extent_xyz": [
+        1000.0,
+        2150.0,
+        538.3091
+      ],
+      "inferred_unit": "mm",
+      "scale_to_meters": 0.001,
+      "normalized_extent_xyz_m": [
+        1.0,
+        2.15,
+        0.5383
+      ],
+      "up_axis": "Y",
+      "status": "audited"
+    },
+    {
+      "asset_id": "圆column",
+      "relative_path": "柱子/圆column.glb",
+      "class_id": 4,
+      "class_name": "柱",
+      "sha256": "728f1c74da9bf7ce91adb6250e78e3331c316485bf433a297f2d66152f6ac0b5",
+      "vertex_count": 52692,
+      "triangle_count": 98008,
+      "baked_raw_extent_xyz": [
+        0.02,
+        0.1068,
+        0.02
+      ],
+      "inferred_unit": "m",
+      "scale_to_meters": 1.0,
+      "normalized_extent_xyz_m": [
+        0.02,
+        0.1068,
+        0.02
+      ],
+      "up_axis": "Y",
+      "status": "audited"
+    },
+    {
+      "asset_id": "方column",
+      "relative_path": "柱子/方column.glb",
+      "class_id": 4,
+      "class_name": "柱",
+      "sha256": "6ebc788a10991d2198affc42f8aed058e1231d850307420c877072d6627fb5b3",
+      "vertex_count": 1228,
+      "triangle_count": 870,
+      "baked_raw_extent_xyz": [
+        0.1274,
+        0.6487,
+        0.1281
+      ],
+      "inferred_unit": "m",
+      "scale_to_meters": 1.0,
+      "normalized_extent_xyz_m": [
+        0.1274,
+        0.6487,
+        0.1281
+      ],
+      "up_axis": "Y",
+      "status": "audited"
+    },
+    {
+      "asset_id": "folding_table",
+      "relative_path": "桌子/folding_table.glb",
+      "class_id": 8,
+      "class_name": "桌子",
+      "sha256": "f2d055fa533196874ff09e979fad419e5c4aa4139742d93ba2e154a781cbeb93",
+      "vertex_count": 3750,
+      "triangle_count": 5556,
+      "baked_raw_extent_xyz": [
+        1.9456,
+        0.8057,
+        0.7883
+      ],
+      "inferred_unit": "m",
+      "scale_to_meters": 1.0,
+      "normalized_extent_xyz_m": [
+        1.9456,
+        0.8057,
+        0.7883
+      ],
+      "up_axis": "Y",
+      "status": "audited"
+    },
+    {
+      "asset_id": "meeting_table",
+      "relative_path": "桌子/meeting_table.glb",
+      "class_id": 8,
+      "class_name": "桌子",
+      "sha256": "1c60e60a54f3e3d02df4ebd4f30e07b6be8f116d45778dd62626dd49e9aa13ad",
+      "vertex_count": 22712,
+      "triangle_count": 23358,
+      "baked_raw_extent_xyz": [
+        6500.8452,
+        750.9636,
+        1600.0002
+      ],
+      "inferred_unit": "mm",
+      "scale_to_meters": 0.001,
+      "normalized_extent_xyz_m": [
+        6.5008,
+        0.751,
+        1.6
+      ],
+      "up_axis": "Y",
+      "status": "audited"
+    },
+    {
+      "asset_id": "office_desk_7_mb",
+      "relative_path": "桌子/office_desk_7_mb.glb",
+      "class_id": 8,
+      "class_name": "桌子",
+      "sha256": "278c35e3082ce5bd2cd65689607ff2f9dac7e1f8e8cb9b713e13ccdc4463ea83",
+      "vertex_count": 3004,
+      "triangle_count": 2824,
+      "baked_raw_extent_xyz": [
+        3.9768,
+        2.6503,
+        3.8907
+      ],
+      "inferred_unit": "m",
+      "scale_to_meters": 1.0,
+      "normalized_extent_xyz_m": [
+        3.9768,
+        2.6503,
+        3.8907
+      ],
+      "up_axis": "Y",
+      "status": "audited"
+    },
+    {
+      "asset_id": "table_desk_-_3mb",
+      "relative_path": "桌子/table_desk_-_3mb.glb",
+      "class_id": 8,
+      "class_name": "桌子",
+      "sha256": "936aa759d2bc0c34617e415e4669a522a7315b8605862b3c5d1cbafbf4c979c9",
+      "vertex_count": 728,
+      "triangle_count": 450,
+      "baked_raw_extent_xyz": [
+        2.0,
+        0.8632,
+        0.9035
+      ],
+      "inferred_unit": "m",
+      "scale_to_meters": 1.0,
+      "normalized_extent_xyz_m": [
+        2.0,
+        0.8632,
+        0.9035
+      ],
+      "up_axis": "Y",
+      "status": "audited"
+    },
+    {
+      "asset_id": "muwanga_lego_sofa_-_office_master.ae_3",
+      "relative_path": "沙发/muwanga_lego_sofa_-_office_master.ae_3.glb",
+      "class_id": 10,
+      "class_name": "沙发",
+      "sha256": "0c524f5ce69ee44c9229b412e81bfa0af80d390b0c9a1ee00aec6e8f8801e407",
+      "vertex_count": 20798,
+      "triangle_count": 34206,
+      "baked_raw_extent_xyz": [
+        2.5231,
+        1.9263,
+        2.0004
+      ],
+      "inferred_unit": "m",
+      "scale_to_meters": 1.0,
+      "normalized_extent_xyz_m": [
+        2.5231,
+        1.9263,
+        2.0004
+      ],
+      "up_axis": "Y",
+      "status": "audited"
+    },
+    {
+      "asset_id": "sofa",
+      "relative_path": "沙发/sofa.glb",
+      "class_id": 10,
+      "class_name": "沙发",
+      "sha256": "5c50d3e54cc32ee2f3558e8ad398c3be2e49afd3118a065abe31b5a4d518e4de",
+      "vertex_count": 2398,
+      "triangle_count": 3888,
+      "baked_raw_extent_xyz": [
+        2.0,
+        0.6593,
+        0.8387
+      ],
+      "inferred_unit": "m",
+      "scale_to_meters": 1.0,
+      "normalized_extent_xyz_m": [
+        2.0,
+        0.6593,
+        0.8387
+      ],
+      "up_axis": "Y",
+      "status": "audited"
+    },
+    {
+      "asset_id": "double_door",
+      "relative_path": "门/double_door.glb",
+      "class_id": 6,
+      "class_name": "门",
+      "sha256": "91ea03891c9b54f42bad5dd8bada59b40b1c972a9d9d8a1548712669199a600f",
+      "vertex_count": 4142,
+      "triangle_count": 3456,
+      "baked_raw_extent_xyz": [
+        24.7438,
+        289.4167,
+        302.8079
+      ],
+      "inferred_unit": "mm",
+      "scale_to_meters": 0.001,
+      "normalized_extent_xyz_m": [
+        0.0247,
+        0.2894,
+        0.3028
+      ],
+      "up_axis": "Y",
+      "status": "audited"
+    },
+    {
+      "asset_id": "单门door",
+      "relative_path": "门/单门door.glb",
+      "class_id": 6,
+      "class_name": "门",
+      "sha256": "7d559c20a52b9ab86ae2cdc19cd79803a8d01cd24c2a0c51669b0375fff17358",
+      "vertex_count": 1531,
+      "triangle_count": 1577,
+      "baked_raw_extent_xyz": [
+        14.01,
+        206.6,
+        97.4149
+      ],
+      "inferred_unit": "cm",
+      "scale_to_meters": 0.01,
+      "normalized_extent_xyz_m": [
+        0.1401,
+        2.066,
+        0.9741
+      ],
+      "up_axis": "Y",
+      "status": "audited"
+    }
+  ]
+}
