@@ -135,13 +135,15 @@ def meshes_penetrate(
     contained_b_in_a = False
     shared_interior = False
     if piercing == 0:
-        # 1. Check centroid containment (catches small part fully inside larger solid)
+        # 1. Check centroid containment (MUST be strictly inside BOTH meshes to avoid concave false positives!)
         sample_a = verts_a.mean(axis=0)
         if np.all(sample_a > min_b + eps) and np.all(sample_a < max_b - eps):
-            contained_a_in_b = point_strictly_inside_closed_mesh(sample_a, verts_b, tris_b, eps=eps)
+            if point_strictly_inside_closed_mesh(sample_a, verts_a, tris_a, eps=eps):
+                contained_a_in_b = point_strictly_inside_closed_mesh(sample_a, verts_b, tris_b, eps=eps)
         sample_b = verts_b.mean(axis=0)
         if np.all(sample_b > min_a + eps) and np.all(sample_b < max_a - eps):
-            contained_b_in_a = point_strictly_inside_closed_mesh(sample_b, verts_a, tris_a, eps=eps)
+            if point_strictly_inside_closed_mesh(sample_b, verts_b, tris_b, eps=eps):
+                contained_b_in_a = point_strictly_inside_closed_mesh(sample_b, verts_a, tris_a, eps=eps)
 
         # 2. Check interior points of the overlap AABB (catches coplanar-face overlaps
         #    where triangle edges lie on each other's faces and centroids lie outside!)

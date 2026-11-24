@@ -132,12 +132,11 @@ def extrude_polygon_solid(
     clean_poly = orient(Polygon(ext_ring, int_rings).buffer(0), sign=1.0)
     if isinstance(clean_poly, MultiPolygon):
         clean_poly = max(clean_poly.geoms, key=lambda g: g.area)
+    clean_poly = orient(clean_poly.simplify(1e-4, preserve_topology=True).buffer(0), sign=1.0)
+    if isinstance(clean_poly, MultiPolygon):
+        clean_poly = max(clean_poly.geoms, key=lambda g: g.area)
 
     # Map every unique 2D vertex (quantized) to a bottom index i and top index i + N
-    ext_ring = _clean_ring(list(clean_poly.exterior.coords), eps=snap_eps)
-    int_rings = [_clean_ring(list(r.coords), eps=snap_eps) for r in clean_poly.interiors]
-    int_rings = [r for r in int_rings if len(r) >= 3]
-
     vert_map: dict[tuple[int, int], int] = {}
     xy_list: list[tuple[float, float]] = []
 
@@ -150,20 +149,7 @@ def extrude_polygon_solid(
             xy_list.append((float(x), float(y)))
         return vid
 
-    ring_vid_lists: list[list[int]] = []
-    for ring in [ext_ring, *int_rings]:
-        vids = [get_vid(x, y) for x, y in ring]
-        # Remove consecutive duplicates after quantization
-        dedup: list[int] = []
-        for vid in vids:
-            if not dedup or dedup[-1] != vid:
-                dedup.append(vid)
-        if len(dedup) >= 2 and dedup[0] == dedup[-1]:
-            dedup.pop()
-        if len(dedup) >= 3:
-            ring_vid_lists.append(dedup)
-
-    # Triangulate the 2D face using GEOS constrained Delaunay (exact vertex preservation!)
+    # Triangulate the 2D face using GEOS constrained Delaunay
     if _cdt is None:
         raise RuntimeError("shapely.constrained_delaunay_triangles is required (shapely>=2.1)")
     tri_collection = _cdt(clean_poly)
@@ -191,6 +177,22 @@ def extrude_polygon_solid(
     if not cap_tris_2d:
         raise ValueError("2D triangulation produced zero triangles")
 
+    # Derive side-wall edges DIRECTLY from the unmatched boundary half-edges of cap_tris_2d!
+    # By graph duality, this mathematically guarantees 0 T-junctions and 0 non-manifold edges.
+    from collections import Counter
+
+    half_edges: Counter[tuple[int, int]] = Counter()
+    for a, b, c in cap_tris_2d:
+        half_edges[(a, b)] += 1
+        half_edges[(b, c)] += 1
+        half_edges[(c, a)] += 1
+
+    boundary_edges: list[tuple[int, int]] = []
+    for (a, b), cnt in half_edges.items():
+        net = cnt - half_edges.get((b, a), 0)
+        for _ in range(max(0, net)):
+            boundary_edges.append((a, b))
+
     n = len(xy_list)
     xy = np.asarray(xy_list, dtype=np.float64)
     verts = np.empty((2 * n, 3), dtype=np.float64)
@@ -206,17 +208,10 @@ def extrude_polygon_solid(
     # Bottom cap (-Z normal -> CW)
     for a, b, c in cap_tris_2d:
         tris.append((a, c, b))
-    # Side walls: exterior ring is CCW so outward normal is to the right of (a -> b)
-    # Interior hole rings are CW so outward normal (into hole) is also to the right of (a -> b)!
-    for ring_vids in ring_vid_lists:
-        m = len(ring_vids)
-        for k in range(m):
-            a = ring_vids[k]
-            b = ring_vids[(k + 1) % m]
-            if a == b:
-                continue
-            tris.append((a, b, b + n))
-            tris.append((a, b + n, a + n))
+    # Side walls along every boundary half-edge (a -> b) of the CCW cap
+    for a, b in boundary_edges:
+        tris.append((a, b, b + n))
+        tris.append((a, b + n, a + n))
 
     tri_arr = np.asarray(tris, dtype=np.uint32)
     if signed_mesh_volume(verts, tri_arr) < 0:
