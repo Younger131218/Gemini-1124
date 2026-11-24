@@ -135,13 +135,15 @@ def run_pipeline(
         parts.extend(table_parts)
 
         cab_parts, cab_bands, cab_audit = build_cabinet_parts(
-            fc, shell, static_blockers, z_blockers, table_specs, cloud.points_local, wl_state.work_labels, pcfg.furniture
+            fc, shell, static_blockers, z_blockers, table_specs, cloud.points_local, wl_state.work_labels, pcfg.furniture,
+            library=library,
         )
         parts.extend(cab_parts)
 
         sofa_blockers = [*z_blockers, *cab_bands, *[(ts.poly_uv, ts.z_floor, ts.z_top) for ts in table_specs]]
         sofa_parts, sofa_bands, sofa_audit = build_sofa_parts(
-            fc, shell, static_blockers, sofa_blockers, cloud.points_local, wl_state.work_labels, pcfg.furniture
+            fc, shell, static_blockers, sofa_blockers, cloud.points_local, wl_state.work_labels, pcfg.furniture,
+            library=library,
         )
         parts.extend(sofa_parts)
 

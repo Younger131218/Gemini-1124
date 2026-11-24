@@ -1,4 +1,4 @@
-"""Stage 2 B15 structural reconstruction for tables (cls 8), cabinets (cls 9), and sofas (cls 10)."""
+"""Stage 2 B10/B15 structural & library-matched reconstruction for tables (8), cabinets (9), and sofas (10)."""
 
 from __future__ import annotations
 
@@ -9,11 +9,12 @@ import numpy as np
 from scipy import ndimage
 from shapely.geometry import MultiPolygon, Point, Polygon, box
 from shapely.geometry.polygon import orient
-from shapely.ops import unary_union
+from shapely.ops import nearest_points, unary_union
 
 from ipcr.architecture.frame_floors import FloorCeilingResult, _raster_mask_to_polygon, _snap_orthogonal_polygon
 from ipcr.architecture.walls_shell import ExteriorShellPlan
 from ipcr.config import FurnitureConfig
+from ipcr.furniture.library import FurnitureLibrary
 from ipcr.geometry_primitives import extrude_polygon_solid
 from ipcr.types import MeshPart
 from ipcr.working_labels import _voxel_connected_components_3d
@@ -68,6 +69,63 @@ def _extract_contour_uv(pts_uv: np.ndarray, *, cell: float = 0.05) -> Polygon | 
     return _snap_orthogonal_polygon(raw, simplify_tol=0.06, min_edge_len=0.15)
 
 
+def _extract_dense_core_uv(pts_uv: np.ndarray, *, cell: float = 0.08) -> np.ndarray:
+    """Filter out sparse disconnected wall-bleed slivers behind a cabinet via 2D density-connected core."""
+    if len(pts_uv) < 200:
+        return pts_uv
+    u0, v0 = float(pts_uv[:, 0].min()) - 0.16, float(pts_uv[:, 1].min()) - 0.16
+    u1, v1 = float(pts_uv[:, 0].max()) + 0.16, float(pts_uv[:, 1].max()) + 0.16
+    nu = int(np.ceil((u1 - u0) / cell)) + 2
+    nv = int(np.ceil((v1 - v0) / cell)) + 2
+    if nu * nv > 500_000:
+        return pts_uv
+    iu = np.clip(np.floor((pts_uv[:, 0] - u0) / cell).astype(np.int64), 0, nu - 1)
+    iv = np.clip(np.floor((pts_uv[:, 1] - v0) / cell).astype(np.int64), 0, nv - 1)
+    counts = np.zeros((nu, nv), dtype=np.int32)
+    np.add.at(counts, (iu, iv), 1)
+    nz = counts[counts > 0]
+    if len(nz) == 0:
+        return pts_uv
+    # Scale-invariant density threshold: strips sparse rear wall-bleed bridges (<< 12% of median cell density)
+    min_cell = max(4, int(float(np.median(nz)) * 0.12))
+    mask = counts >= min_cell
+    labeled, ncomp = ndimage.label(mask, structure=np.ones((3, 3), dtype=bool))
+    if ncomp <= 1:
+        return pts_uv
+    # Keep the highest-point-count connected 2D component (strips disconnected rear wall-bleed!)
+    comp_pts = [int(counts[labeled == cid].sum()) for cid in range(1, ncomp + 1)]
+    best_cid = 1 + int(np.argmax(comp_pts))
+    keep_mask = labeled[iu, iv] == best_cid
+    if int(keep_mask.sum()) >= len(pts_uv) * 0.45:
+        return pts_uv[keep_mask]
+    return pts_uv
+
+
+def _fit_obb_2d(pts_uv: np.ndarray, snap_deg: float = 12.0) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+    """Fit clean 2D OBB returning (center_uv, long_dir, depth_dir, length, depth)."""
+    mean_uv = pts_uv.mean(axis=0)
+    centered = pts_uv - mean_uv
+    cov = (centered.T @ centered) / max(len(pts_uv), 1)
+    _, eigvecs = np.linalg.eigh(cov)
+    long_dir = eigvecs[:, 1].copy()
+    long_dir /= max(float(np.linalg.norm(long_dir)), 1e-9)
+
+    # Snap to room U/V axis ONLY if already within snap_deg (preserves genuinely angled cabinets!)
+    cos_s = float(np.cos(np.radians(snap_deg)))
+    for ax in (np.array([1.0, 0.0]), np.array([-1.0, 0.0]), np.array([0.0, 1.0]), np.array([0.0, -1.0])):
+        if float(np.dot(long_dir, ax)) >= cos_s:
+            long_dir = ax.copy()
+            break
+    depth_dir = np.array([-long_dir[1], long_dir[0]], dtype=np.float64)
+
+    sl = centered @ long_dir
+    sd = centered @ depth_dir
+    l0, l1 = float(np.percentile(sl, 2)), float(np.percentile(sl, 98))
+    d0, d1 = float(np.percentile(sd, 2)), float(np.percentile(sd, 98))
+    center = mean_uv + long_dir * (0.5 * (l0 + l1)) + depth_dir * (0.5 * (d0 + d1))
+    return center, long_dir, depth_dir, l1 - l0, d1 - d0
+
+
 def build_table_parts(
     fc: FloorCeilingResult,
     shell: ExteriorShellPlan,
@@ -113,7 +171,6 @@ def build_table_parts(
             })
             continue
 
-        # Extract tabletop surface points (top 14cm slice) to preserve exact functional contour (B15)
         top_slice = sub[sub[:, 2] >= z_top - 0.14]
         if len(top_slice) < 80:
             top_slice = sub
@@ -121,20 +178,17 @@ def build_table_parts(
         if contour is None:
             continue
 
-        # Decide rectangular vs genuine L/U-shaped contour via fill ratio against tight axis-aligned box
         u0, v0, u1, v1 = contour.bounds
         aabb_poly = box(u0, v0, u1, v1)
         fill_ratio = float(contour.area / max(aabb_poly.area, 1e-6))
         is_rect = fill_ratio >= 0.80
         if is_rect:
-            # Use crisp 2-98% measured UV rectangle for clean straight tabletop edges
             ru0, ru1 = float(np.percentile(top_slice[:, 0], 2)), float(np.percentile(top_slice[:, 0], 98))
             rv0, rv1 = float(np.percentile(top_slice[:, 1], 2)), float(np.percentile(top_slice[:, 1], 98))
             poly_uv = box(ru0, rv0, ru1, rv1)
         else:
             poly_uv = contour
 
-        # Clip strictly inside allowed room shell minus stairs/railings overlapping vertically & prior tables
         cur_allowed = allowed_base
         ov_bands = [p.buffer(cfg.clearance_m) for p, bz0, bz1 in z_blocker_bands if bz0 <= z_top + 0.02 and bz1 >= z_floor - 0.02]
         if ov_bands:
@@ -192,12 +246,11 @@ def build_table_parts(
                     "extent_uv_m": [round(du, 3), round(dv, 3)],
                     "z_top_above_floor_m": round(z_top - z_floor, 3),
                     "point_count": int(len(comp)),
-                    "library_fallback_reason": "raw_library_table_glbs_non_watertight_b21",
+                    "library_fallback_reason": "b15_exact_contour_and_open_under_desk_space",
                 },
             )
         )
 
-        # Build open structural legs strictly beneath tabletop (leaving open knee/chair tuck space per B15!)
         leg_sz = cfg.table_leg_size_m
         leg_z0 = z_floor + 0.002
         leg_z1 = top_bot - 0.002
@@ -206,7 +259,6 @@ def build_table_parts(
         if leg_z1 - leg_z0 >= 0.25:
             leg_centers: list[tuple[float, float]] = []
             if is_rect and len(list(poly_clean.exterior.coords)) <= 6:
-                # Place legs slightly inset so tucked chairs along long sides never hit legs
                 long_u = du >= dv
                 in_u = min(0.18 if (not long_u and du >= 1.1) else 0.09, du * 0.25)
                 in_v = min(0.18 if (long_u and dv >= 1.1) else 0.09, dv * 0.25)
@@ -220,7 +272,6 @@ def build_table_parts(
                     for lv in vs:
                         leg_centers.append((float(lu), float(lv)))
             else:
-                # Shaped/L-table: place legs at vertices of inset polygon
                 inset = poly_clean.buffer(-0.10, join_style=2)
                 if isinstance(inset, MultiPolygon):
                     inset = max(inset.geoms, key=lambda g: g.area)
@@ -282,6 +333,17 @@ def build_table_parts(
     }
 
 
+def _obb_poly(center: np.ndarray, long_dir: np.ndarray, depth_dir: np.ndarray, length: float, depth: float) -> Polygon:
+    hl, hd = 0.5 * length, 0.5 * depth
+    corners = [
+        center - long_dir * hl - depth_dir * hd,
+        center + long_dir * hl - depth_dir * hd,
+        center + long_dir * hl + depth_dir * hd,
+        center - long_dir * hl + depth_dir * hd,
+    ]
+    return orient(Polygon(corners), sign=1.0)
+
+
 def build_cabinet_parts(
     fc: FloorCeilingResult,
     shell: ExteriorShellPlan,
@@ -291,13 +353,16 @@ def build_cabinet_parts(
     points_local: np.ndarray,
     work_labels: np.ndarray,
     cfg: FurnitureConfig,
+    *,
+    library: FurnitureLibrary | None = None,
 ) -> tuple[list[MeshPart], list[tuple[Polygon, float, float]], dict[str, Any]]:
-    """Build B15/B12 cabinets (freestanding/wall-side cabinets + under-table pedestals, never swallowing tables)."""
+    """Build B10/B15 cabinets: dense-core OBB depth, front-facing direction, and tiled library armored_cabinet2.glb."""
     uvz = fc.frame.pts_to_uvz(points_local)
     cpts = uvz[work_labels == 9]
     if len(cpts) < cfg.cabinet_min_points:
-        return [], [], {"emitted_cabinets": 0, "cabinets": [], "rejected": []}
+        return [], [], {"emitted_cabinets": 0, "emitted_parts": 0, "cabinets": [], "rejected": []}
 
+    cab_asset = library.get_best_asset(9) if library is not None else None
     allowed_base = shell.inner_uv.buffer(-cfg.clearance_m)
     if static_blockers_uv:
         allowed_base = allowed_base.difference(unary_union([p.buffer(cfg.clearance_m) for p in static_blockers_uv])).buffer(0)
@@ -308,23 +373,25 @@ def build_cabinet_parts(
     logs: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     placed_union: Polygon | MultiPolygon | None = None
+    cab_group_idx = 0
 
     for ci, comp in enumerate(comps):
         if len(comp) < cfg.cabinet_min_points:
             continue
         sub = cpts[comp]
-        u0, u1 = float(np.percentile(sub[:, 0], 2)), float(np.percentile(sub[:, 0], 98))
-        v0, v1 = float(np.percentile(sub[:, 1], 2)), float(np.percentile(sub[:, 1], 98))
-        du, dv = u1 - u0, v1 - v0
+        # Strip disconnected rear wall-bleed slivers before measuring cabinet OBB depth!
+        core_uv = _extract_dense_core_uv(sub[:, :2], cell=0.08)
+        center_uv, long_dir, depth_dir, length, depth = _fit_obb_2d(core_uv, snap_deg=12.0)
+
         z_lo_raw = float(np.percentile(sub[:, 2], 2))
         z_hi_raw = float(np.percentile(sub[:, 2], 98))
-        z_floor = _local_floor_z(fc, 0.5 * (u0 + u1), 0.5 * (v0 + v1), z_lo_raw)
+        z_floor = _local_floor_z(fc, float(center_uv[0]), float(center_uv[1]), z_lo_raw)
 
-        if min(du, dv) < cfg.cabinet_min_depth_m or max(du, dv) < cfg.cabinet_min_width_m:
+        if depth < cfg.cabinet_min_depth_m or length < cfg.cabinet_min_width_m:
             rejected.append({
                 "cluster_idx": ci,
                 "point_count": int(len(comp)),
-                "extent_uv_m": [round(du, 3), round(dv, 3)],
+                "obb_ld_m": [round(length, 3), round(depth, 3)],
                 "reason": "paper_thin_or_too_small_for_cabinet",
             })
             continue
@@ -337,10 +404,9 @@ def build_cabinet_parts(
             })
             continue
 
-        # Ground near-floor cabinets cleanly; reject tiny high floating specks
         if z_lo_raw - z_floor <= 0.45:
             z_bot = z_floor + 0.002
-        elif len(comp) >= 2000 and min(du, dv) >= 0.22:
+        elif len(comp) >= 2000 and depth >= 0.22:
             z_bot = z_lo_raw
         else:
             rejected.append({
@@ -354,36 +420,34 @@ def build_cabinet_parts(
         z_top = z_hi_raw
         if fc.ceiling_z is not None:
             z_top = min(z_top, fc.ceiling_z - 0.005)
-        # Cap beneath any overhead upper floor or secondary ceiling
-        cand_rect = box(u0, v0, u1, v1)
+        cand_poly = _obb_poly(center_uv, long_dir, depth_dir, length, depth)
+
         for flv in fc.floor_levels:
-            if not flv.is_primary and flv.polygon_uv.intersects(cand_rect):
+            if not flv.is_primary and flv.polygon_uv.intersects(cand_poly):
                 fbot = flv.z_top - 0.12
                 if z_bot < fbot - 0.20 and z_top > fbot - 0.005:
                     z_top = fbot - 0.005
         for clv in fc.ceiling_levels:
-            if not clv.is_primary and clv.polygon_uv.intersects(cand_rect):
+            if not clv.is_primary and clv.polygon_uv.intersects(cand_poly):
                 if z_bot < clv.z_bottom - 0.20 and z_top > clv.z_bottom - 0.005:
                     z_top = clv.z_bottom - 0.005
 
-        # B12/B15 Table Clearance: under-table pedestal stays strictly below tabletop; tall cabinet never swallows table!
         extra_blockers: list[Polygon] = [
             p.buffer(cfg.clearance_m) for p, bz0, bz1 in z_blocker_bands if bz0 <= z_top + 0.02 and bz1 >= z_bot - 0.02
         ]
-        role = "cabinet"
+        is_under_table = False
         for ts in table_specs:
-            if not ts.poly_uv.intersects(cand_rect):
+            if not ts.poly_uv.intersects(cand_poly):
                 continue
             if z_hi_raw <= ts.z_top + 0.05:
-                # Genuine under-table pedestal / modesty panel: cap strictly below tabletop bottom & avoid legs!
                 z_top = min(z_top, ts.tabletop_z_bot - 0.006)
                 extra_blockers.extend(lp.buffer(cfg.clearance_m) for lp in ts.leg_polys_uv)
-                role = "cabinet_under_table"
+                is_under_table = True
             else:
-                # Freestanding tall cabinet adjacent to table: subtract table XY footprint so it NEVER swallows table!
                 extra_blockers.append(ts.poly_uv.buffer(cfg.clearance_m))
 
-        if z_top - z_bot < cfg.cabinet_min_height_m:
+        height = z_top - z_bot
+        if height < cfg.cabinet_min_height_m:
             rejected.append({"cluster_idx": ci, "point_count": int(len(comp)), "reason": "insufficient_height_after_clearance"})
             continue
 
@@ -393,45 +457,142 @@ def build_cabinet_parts(
         if placed_union is not None and not placed_union.is_empty:
             cur_allowed = cur_allowed.difference(placed_union.buffer(cfg.clearance_m))
 
-        clipped = cand_rect.intersection(cur_allowed).buffer(0)
+        clipped = cand_poly.intersection(cur_allowed).buffer(0)
         if isinstance(clipped, MultiPolygon):
             clipped = max(clipped.geoms, key=lambda g: g.area)
         if not isinstance(clipped, Polygon) or clipped.is_empty or clipped.area < 0.05:
             rejected.append({"cluster_idx": ci, "point_count": int(len(comp)), "reason": "eliminated_by_clearance"})
             continue
 
-        poly_clean = orient(clipped.buffer(0), sign=1.0)
-        if isinstance(poly_clean, MultiPolygon):
-            poly_clean = max(poly_clean.geoms, key=lambda g: g.area)
-        try:
-            cv_uv, ct = extrude_polygon_solid(poly_clean, z_bot, z_top)
-        except ValueError:
-            continue
+        # Determine cabinet front-facing direction (+depth_dir vs -depth_dir):
+        # Front face has higher scanned point density AND faces away from nearest exterior wall!
+        sd_core = (core_uv - center_uv[None, :]) @ depth_dir
+        pos_cnt = int(np.sum(sd_core > 0.15 * depth))
+        neg_cnt = int(np.sum(sd_core < -0.15 * depth))
+        np_wall, _ = nearest_points(shell.inner_uv.exterior, Point(float(center_uv[0]), float(center_uv[1])))
+        away_wall = np.array([center_uv[0] - np_wall.x, center_uv[1] - np_wall.y], dtype=np.float64)
+        if abs(pos_cnt - neg_cnt) >= max(pos_cnt, neg_cnt) * 0.20:
+            front_dir = depth_dir if pos_cnt >= neg_cnt else -depth_dir
+        else:
+            front_dir = depth_dir if float(np.dot(away_wall, depth_dir)) >= 0 else -depth_dir
 
-        pid = f"cabinet_{len(parts):02d}"
-        parts.append(
-            MeshPart(
-                part_id=pid,
-                class_id=9,
-                role=role,
-                vertices=fc.frame.uvz_to_xyz(cv_uv),
-                triangles=ct,
-                evidence_kind="parametric_rule_fallback",
-                metadata={
-                    "extent_uv_m": [round(du, 3), round(dv, 3)],
-                    "area_m2": round(float(poly_clean.area), 3),
-                    "z_span": [round(z_bot, 4), round(z_top, 4)],
-                    "point_count": int(len(comp)),
-                    "library_fallback_reason": "raw_library_cabinet_glbs_non_watertight_b21",
-                },
+        # Right-handed lateral axis (+X_local = right = (fy_y, -fy_x))
+        right_dir = np.array([front_dir[1], -front_dir[0]], dtype=np.float64)
+
+        # Use verified watertight library cabinet (armored_cabinet2.glb) for freestanding/wall-side cabinets (height>=0.80m)!
+        used_library = False
+        if cab_asset is not None and not is_under_table and height >= 0.80 and depth >= 0.18:
+            # Re-measure clipped extents along (right_dir, front_dir) so library units fit strictly inside cur_allowed!
+            c_pts = np.asarray(list(clipped.exterior.coords)[:-1], dtype=np.float64)
+            sr = (c_pts - center_uv[None, :]) @ right_dir
+            sf = (c_pts - center_uv[None, :]) @ front_dir
+            r_lo, r_hi = float(sr.min()), float(sr.max())
+            f_lo, f_hi = float(sf.min()), float(sf.max())
+            eff_w = r_hi - r_lo
+            eff_d = f_hi - f_lo
+            unit_gap = 0.008
+            asset_w, asset_d, asset_h = float(cab_asset.extents_xyz[0]), float(cab_asset.extents_xyz[1]), float(cab_asset.extents_xyz[2])
+            n_units = max(1, int(round(eff_w / max(asset_w, 0.50))))
+            unit_w = (eff_w - (n_units - 1) * unit_gap) / n_units
+            if unit_w >= 0.24 and eff_d >= 0.16:
+                emitted_units = 0
+                unit_polys: list[Polygon] = []
+                for uk in range(n_units):
+                    ur_lo = r_lo + uk * (unit_w + unit_gap)
+                    ur_hi = ur_lo + unit_w
+                    u_center = center_uv + right_dir * (0.5 * (ur_lo + ur_hi)) + front_dir * (0.5 * (f_lo + f_hi))
+                    upoly = _obb_poly(u_center, right_dir, front_dir, unit_w, eff_d)
+                    if not cur_allowed.buffer(0.002).contains(upoly):
+                        # Slight inset if angled corner grazes wall
+                        upoly_in = _obb_poly(u_center, right_dir, front_dir, unit_w * 0.96, eff_d * 0.96)
+                        if not cur_allowed.buffer(0.002).contains(upoly_in):
+                            continue
+                        sx = (unit_w * 0.96) / asset_w
+                        sy = (eff_d * 0.96) / asset_d
+                        upoly = upoly_in
+                    else:
+                        sx = unit_w / asset_w
+                        sy = eff_d / asset_d
+                    sz = height / asset_h
+                    v_uvz, tri = cab_asset.transform_to_uvz(u_center, z_bot, front_dir, sx, sy, sz)
+                    pid = f"cabinet_{cab_group_idx:02d}" if n_units == 1 else f"cabinet_{cab_group_idx:02d}_unit_{uk:02d}"
+                    parts.append(
+                        MeshPart(
+                            part_id=pid,
+                            class_id=9,
+                            role="cabinet",
+                            vertices=fc.frame.uvz_to_xyz(v_uvz),
+                            triangles=tri,
+                            evidence_kind="library_matched",
+                            metadata={
+                                "cabinet_group": f"cabinet_{cab_group_idx:02d}",
+                                "asset_id": cab_asset.asset_id,
+                                "asset_sha256": cab_asset.sha256,
+                                "unit_index": uk,
+                                "unit_count": n_units,
+                                "unit_wdh_m": [round(unit_w, 3), round(eff_d, 3), round(height, 3)],
+                                "front_dir_uv": [round(float(front_dir[0]), 4), round(float(front_dir[1]), 4)],
+                                "z_span": [round(z_bot, 4), round(z_top, 4)],
+                                "point_count": int(len(comp)),
+                            },
+                        )
+                    )
+                    unit_polys.append(upoly)
+                    cab_bands.append((upoly, z_bot, z_top))
+                    emitted_units += 1
+
+                if emitted_units > 0:
+                    used_library = True
+                    u_union = unary_union(unit_polys)
+                    placed_union = u_union if placed_union is None else unary_union([placed_union, u_union])
+                    logs.append({
+                        "cabinet_id": f"cabinet_{cab_group_idx:02d}",
+                        "library_matched": True,
+                        "asset_id": cab_asset.asset_id,
+                        "unit_count": emitted_units,
+                        "obb_ldh_m": [round(eff_w, 3), round(eff_d, 3), round(height, 3)],
+                        "front_dir_uv": [round(float(front_dir[0]), 4), round(float(front_dir[1]), 4)],
+                        "z_span": [round(z_bot, 4), round(z_top, 4)],
+                        "point_count": int(len(comp)),
+                    })
+                    cab_group_idx += 1
+
+        if not used_library:
+            poly_clean = orient(clipped.buffer(0), sign=1.0)
+            if isinstance(poly_clean, MultiPolygon):
+                poly_clean = max(poly_clean.geoms, key=lambda g: g.area)
+            try:
+                cv_uv, ct = extrude_polygon_solid(poly_clean, z_bot, z_top)
+            except ValueError:
+                continue
+            pid = f"cabinet_{cab_group_idx:02d}"
+            role = "cabinet_under_table" if is_under_table else "cabinet"
+            parts.append(
+                MeshPart(
+                    part_id=pid,
+                    class_id=9,
+                    role=role,
+                    vertices=fc.frame.uvz_to_xyz(cv_uv),
+                    triangles=ct,
+                    evidence_kind="parametric_rule_fallback",
+                    metadata={
+                        "obb_ldh_m": [round(length, 3), round(depth, 3), round(height, 3)],
+                        "area_m2": round(float(poly_clean.area), 3),
+                        "z_span": [round(z_bot, 4), round(z_top, 4)],
+                        "point_count": int(len(comp)),
+                        "library_fallback_reason": "under_table_pedestal_or_library_unavailable",
+                    },
+                )
             )
-        )
-        cab_bands.append((poly_clean, z_bot, z_top))
-        placed_union = poly_clean if placed_union is None else unary_union([placed_union, poly_clean])
-        logs.append(parts[-1].metadata | {"part_id": pid, "role": role})
+            cab_bands.append((poly_clean, z_bot, z_top))
+            placed_union = poly_clean if placed_union is None else unary_union([placed_union, poly_clean])
+            logs.append(parts[-1].metadata | {"cabinet_id": pid, "library_matched": False, "role": role})
+            cab_group_idx += 1
 
     return parts, cab_bands, {
-        "emitted_cabinets": len(parts),
+        "emitted_cabinets": len(logs),
+        "emitted_parts": len(parts),
+        "library_asset_used": cab_asset.asset_id if cab_asset is not None else None,
         "cabinets": logs,
         "rejected": rejected,
     }
@@ -445,13 +606,16 @@ def build_sofa_parts(
     points_local: np.ndarray,
     work_labels: np.ndarray,
     cfg: FurnitureConfig,
+    *,
+    library: FurnitureLibrary | None = None,
 ) -> tuple[list[MeshPart], list[tuple[Polygon, float, float]], dict[str, Any]]:
-    """Build B15 multi-part structural sofas (seat + backrest + armrests) while rejecting thin wall-bleed."""
+    """Build library-matched watertight sofa (sofa.glb) or multi-part fallback while rejecting thin wall-bleed."""
     uvz = fc.frame.pts_to_uvz(points_local)
     spts = uvz[work_labels == 10]
     if len(spts) < cfg.sofa_min_points:
-        return [], [], {"emitted_sofas": 0, "sofas": [], "rejected": []}
+        return [], [], {"emitted_sofas": 0, "emitted_parts": 0, "sofas": [], "rejected": []}
 
+    sofa_asset = library.get_best_asset(10) if library is not None else None
     allowed_base = shell.inner_uv.buffer(-cfg.clearance_m)
     if static_blockers_uv:
         allowed_base = allowed_base.difference(unary_union([p.buffer(cfg.clearance_m) for p in static_blockers_uv])).buffer(0)
@@ -467,19 +631,17 @@ def build_sofa_parts(
         if len(comp) < cfg.sofa_min_points:
             continue
         sub = spts[comp]
-        u0, u1 = float(np.percentile(sub[:, 0], 2)), float(np.percentile(sub[:, 0], 98))
-        v0, v1 = float(np.percentile(sub[:, 1], 2)), float(np.percentile(sub[:, 1], 98))
-        du, dv = u1 - u0, v1 - v0
+        center_uv, long_dir, depth_dir, length, depth = _fit_obb_2d(sub[:, :2], snap_deg=12.0)
         z_lo = float(np.percentile(sub[:, 2], 2))
         z_hi = float(np.percentile(sub[:, 2], 98))
-        z_floor = _local_floor_z(fc, 0.5 * (u0 + u1), 0.5 * (v0 + v1), z_lo)
+        z_floor = _local_floor_z(fc, float(center_uv[0]), float(center_uv[1]), z_lo)
         h = z_hi - z_floor
 
-        if min(du, dv) < cfg.sofa_min_depth_m or max(du, dv) < cfg.sofa_min_width_m or h < cfg.sofa_min_height_m:
+        if depth < cfg.sofa_min_depth_m or length < cfg.sofa_min_width_m or h < cfg.sofa_min_height_m:
             rejected.append({
                 "cluster_idx": ci,
                 "point_count": int(len(comp)),
-                "extent_uv_m": [round(du, 3), round(dv, 3)],
+                "obb_ld_m": [round(length, 3), round(depth, 3)],
                 "height_m": round(h, 3),
                 "reason": "below_min_sofa_dimensions",
             })
@@ -488,7 +650,7 @@ def build_sofa_parts(
             rejected.append({"cluster_idx": ci, "point_count": int(len(comp)), "reason": "floating_sofa_rejected"})
             continue
 
-        cand_rect = box(u0, v0, u1, v1)
+        cand_poly = _obb_poly(center_uv, long_dir, depth_dir, length, depth)
         cur_allowed = allowed_base
         ov = [p.buffer(cfg.clearance_m) for p, bz0, bz1 in z_blocker_bands if bz0 <= z_hi + 0.02 and bz1 >= z_floor - 0.02]
         if ov:
@@ -496,69 +658,87 @@ def build_sofa_parts(
         if placed_union is not None and not placed_union.is_empty:
             cur_allowed = cur_allowed.difference(placed_union.buffer(cfg.clearance_m))
 
-        clipped = cand_rect.intersection(cur_allowed).buffer(0)
+        clipped = cand_poly.intersection(cur_allowed).buffer(0)
         if isinstance(clipped, MultiPolygon):
             clipped = max(clipped.geoms, key=lambda g: g.area)
         if not isinstance(clipped, Polygon) or clipped.is_empty or clipped.area < 0.35:
             rejected.append({"cluster_idx": ci, "point_count": int(len(comp)), "reason": "eliminated_by_clearance"})
             continue
 
-        minx, miny, maxx, maxy = clipped.bounds
-        w_u, w_v = maxx - minx, maxy - miny
-        if min(w_u, w_v) < cfg.sofa_min_depth_m * 0.85:
-            continue
-
-        # Determine backrest side (high-Z centroid vs low-Z centroid along shorter depth axis)
         high_pts = sub[sub[:, 2] >= z_floor + 0.65 * h]
         low_pts = sub[sub[:, 2] <= z_floor + 0.45 * h]
+        if len(high_pts) >= 20 and len(low_pts) >= 20:
+            v_front = low_pts[:, :2].mean(axis=0) - high_pts[:, :2].mean(axis=0)
+            front_dir = depth_dir if float(np.dot(v_front, depth_dir)) >= 0 else -depth_dir
+        else:
+            np_w, _ = nearest_points(shell.inner_uv.exterior, Point(float(center_uv[0]), float(center_uv[1])))
+            away = np.array([center_uv[0] - np_w.x, center_uv[1] - np_w.y], dtype=np.float64)
+            front_dir = depth_dir if float(np.dot(away, depth_dir)) >= 0 else -depth_dir
+
+        sid = f"sofa_{len(logs):02d}"
+        if sofa_asset is not None and cur_allowed.buffer(0.002).contains(cand_poly):
+            sx = length / float(sofa_asset.extents_xyz[0])
+            sy = depth / float(sofa_asset.extents_xyz[1])
+            sz = h / float(sofa_asset.extents_xyz[2])
+            v_uvz, tri = sofa_asset.transform_to_uvz(center_uv, z_floor + 0.002, front_dir, sx, sy, sz)
+            parts.append(
+                MeshPart(
+                    part_id=sid,
+                    class_id=10,
+                    role="sofa",
+                    vertices=fc.frame.uvz_to_xyz(v_uvz),
+                    triangles=tri,
+                    evidence_kind="library_matched",
+                    metadata={"asset_id": sofa_asset.asset_id, "asset_sha256": sofa_asset.sha256},
+                )
+            )
+            sofa_bands.append((cand_poly, z_floor, z_hi))
+            placed_union = cand_poly if placed_union is None else unary_union([placed_union, cand_poly])
+            logs.append({"sofa_id": sid, "library_matched": True, "asset_id": sofa_asset.asset_id, "obb_ldh_m": [round(length, 3), round(depth, 3), round(h, 3)]})
+            continue
+
+        # Clean 4-part closed parametric fallback when library unavailable
+        minx, miny, maxx, maxy = clipped.bounds
+        w_u, w_v = maxx - minx, maxy - miny
         z_seat = z_floor + min(0.44, max(0.32, 0.50 * h))
         z_arm = z_floor + min(0.64, max(z_seat + 0.14, 0.72 * h))
         back_t = min(0.22, min(w_u, w_v) * 0.28)
         arm_t = min(0.14, max(w_u, w_v) * 0.12)
-
-        sid = f"sofa_{len(logs):02d}"
         if w_u >= w_v:
-            # Sofa spans U, depth along V
-            back_at_max_v = (
-                float(high_pts[:, 1].mean()) > float(low_pts[:, 1].mean())
-                if len(high_pts) and len(low_pts)
-                else True
-            )
+            back_at_max_v = float(front_dir[1]) < 0
             if back_at_max_v:
-                back_box = box(minx, maxy - back_t, maxx, maxy)
-                seat_box = box(minx + arm_t + 0.004, miny, maxx - arm_t - 0.004, maxy - back_t - 0.004)
-                arm_l = box(minx, miny, minx + arm_t, maxy - back_t - 0.004)
-                arm_r = box(maxx - arm_t, miny, maxx, maxy - back_t - 0.004)
+                sub_specs = [
+                    ("back", box(minx, maxy - back_t, maxx, maxy), z_hi),
+                    ("seat", box(minx + arm_t + 0.004, miny, maxx - arm_t - 0.004, maxy - back_t - 0.004), z_seat),
+                    ("arm_l", box(minx, miny, minx + arm_t, maxy - back_t - 0.004), z_arm),
+                    ("arm_r", box(maxx - arm_t, miny, maxx, maxy - back_t - 0.004), z_arm),
+                ]
             else:
-                back_box = box(minx, miny, maxx, miny + back_t)
-                seat_box = box(minx + arm_t + 0.004, miny + back_t + 0.004, maxx - arm_t - 0.004, maxy)
-                arm_l = box(minx, miny + back_t + 0.004, minx + arm_t, maxy)
-                arm_r = box(maxx - arm_t, miny + back_t + 0.004, maxx, maxy)
+                sub_specs = [
+                    ("back", box(minx, miny, maxx, miny + back_t), z_hi),
+                    ("seat", box(minx + arm_t + 0.004, miny + back_t + 0.004, maxx - arm_t - 0.004, maxy), z_seat),
+                    ("arm_l", box(minx, miny + back_t + 0.004, minx + arm_t, maxy), z_arm),
+                    ("arm_r", box(maxx - arm_t, miny + back_t + 0.004, maxx, maxy), z_arm),
+                ]
         else:
-            # Sofa spans V, depth along U
-            back_at_max_u = (
-                float(high_pts[:, 0].mean()) > float(low_pts[:, 0].mean())
-                if len(high_pts) and len(low_pts)
-                else True
-            )
+            back_at_max_u = float(front_dir[0]) < 0
             if back_at_max_u:
-                back_box = box(maxx - back_t, miny, maxx, maxy)
-                seat_box = box(minx, miny + arm_t + 0.004, maxx - back_t - 0.004, maxy - arm_t - 0.004)
-                arm_l = box(minx, miny, maxx - back_t - 0.004, miny + arm_t)
-                arm_r = box(minx, maxy - arm_t, maxx - back_t - 0.004, maxy)
+                sub_specs = [
+                    ("back", box(maxx - back_t, miny, maxx, maxy), z_hi),
+                    ("seat", box(minx, miny + arm_t + 0.004, maxx - back_t - 0.004, maxy - arm_t - 0.004), z_seat),
+                    ("arm_l", box(minx, miny, maxx - back_t - 0.004, miny + arm_t), z_arm),
+                    ("arm_r", box(minx, maxy - arm_t, maxx - back_t - 0.004, maxy), z_arm),
+                ]
             else:
-                back_box = box(minx, miny, minx + back_t, maxy)
-                seat_box = box(minx + back_t + 0.004, miny + arm_t + 0.004, maxx, maxy - arm_t - 0.004)
-                arm_l = box(minx + back_t + 0.004, miny, maxx, miny + arm_t)
-                arm_r = box(minx + back_t + 0.004, maxy - arm_t, maxx, maxy)
+                sub_specs = [
+                    ("back", box(minx, miny, minx + back_t, maxy), z_hi),
+                    ("seat", box(minx + back_t + 0.004, miny + arm_t + 0.004, maxx, maxy - arm_t - 0.004), z_seat),
+                    ("arm_l", box(minx + back_t + 0.004, miny, maxx, miny + arm_t), z_arm),
+                    ("arm_r", box(minx + back_t + 0.004, maxy - arm_t, maxx, maxy), z_arm),
+                ]
 
         emitted_sub = 0
-        for sub_name, sub_poly, z1 in (
-            ("back", back_box, z_hi),
-            ("seat", seat_box, z_seat),
-            ("arm_l", arm_l, z_arm),
-            ("arm_r", arm_r, z_arm),
-        ):
+        for sub_name, sub_poly, z1 in sub_specs:
             sp = sub_poly.intersection(cur_allowed).buffer(0)
             if isinstance(sp, MultiPolygon):
                 sp = max(sp.geoms, key=lambda g: g.area)
@@ -576,7 +756,7 @@ def build_sofa_parts(
                     vertices=fc.frame.uvz_to_xyz(sv_uv),
                     triangles=st,
                     evidence_kind="parametric_rule_fallback",
-                    metadata={"sofa_id": sid, "library_fallback_reason": "raw_library_sofa_glbs_non_watertight_b21"},
+                    metadata={"sofa_id": sid},
                 )
             )
             emitted_sub += 1
@@ -584,17 +764,12 @@ def build_sofa_parts(
         if emitted_sub > 0:
             sofa_bands.append((clipped, z_floor, z_hi))
             placed_union = clipped if placed_union is None else unary_union([placed_union, clipped])
-            logs.append({
-                "sofa_id": sid,
-                "extent_uv_m": [round(w_u, 3), round(w_v, 3)],
-                "height_m": round(h, 3),
-                "parts": emitted_sub,
-                "point_count": int(len(comp)),
-            })
+            logs.append({"sofa_id": sid, "library_matched": False, "obb_ldh_m": [round(length, 3), round(depth, 3), round(h, 3)], "parts": emitted_sub})
 
     return parts, sofa_bands, {
         "emitted_sofas": len(logs),
         "emitted_parts": len(parts),
+        "library_asset_used": sofa_asset.asset_id if sofa_asset is not None else None,
         "sofas": logs,
         "rejected": rejected,
     }

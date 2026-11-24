@@ -383,266 +383,349 @@ def build_stairs_and_railings(
             beam_blocker_bands.append((fgeom.poly_uv.buffer(0.03), fgeom.z_lo - 0.05, fgeom.z_hi + 0.15))
             flight_logs.append(fpart.metadata | {"part_id": fpart.part_id})
 
-    # 2. Build open handrail + vertical baluster railings (class 14, strictly B16: NO solid sheets!)
+    # 2. Build B16 open handrail + vertical baluster railings (class 14, NO solid sheets, NO broken floating stubs!):
+    #    Phase 2a: Flight-guided dual-side continuous sloped stair handrails (anchored strictly onto stair treads!)
+    #    Phase 2b: Remaining non-stair horizontal guardrails (anchored strictly onto supporting floor slabs!)
     rail_allowed_base = shell.inner_uv.buffer(-0.045)
     if static_blockers:
         rail_allowed_base = rail_allowed_base.difference(unary_union([p.buffer(0.045) for p in static_blockers])).buffer(0)
 
     placed_rail_bands: list[tuple[Polygon, float, float]] = []
     rail_group_idx = 0
+    consumed_rail_mask = np.zeros(len(rail_pts), dtype=bool)
 
-    if len(rail_pts) >= 500:
-        r_comps = _voxel_connected_components_3d(rail_pts, voxel_size=0.18)
-        for comp in r_comps:
-            if len(comp) < 400:
+    def _emit_railing_run(
+        r_dir: np.ndarray,
+        r_lat: np.ndarray,
+        w_mid: float,
+        sa: float,
+        sb: float,
+        zt_a: float,
+        zt_b: float,
+        z_bot_fn,
+        *,
+        host_flight: _FlightGeom | None = None,
+    ) -> None:
+        nonlocal rail_group_idx
+        if sb - sa < 0.55:
+            return
+        hr_w = 0.055
+        hr_h = 0.055
+        is_sloped = abs(float(zt_b) - float(zt_a)) >= 0.30
+
+        # Ensure handrail stays strictly above any stair flight it crosses in XY
+        for t_frac in np.linspace(0.0, 1.0, 11):
+            sc = sa + t_frac * (sb - sa)
+            uv_c = r_dir * sc + r_lat * w_mid
+            pt_c = Point(float(uv_c[0]), float(uv_c[1]))
+            for fl in flights:
+                if fl.poly_uv.buffer(0.04).contains(pt_c):
+                    min_hr_z = fl.step_top_z_at(float(uv_c[0]), float(uv_c[1])) + 0.16
+                    cur_z = zt_a + t_frac * (zt_b - zt_a)
+                    if cur_z < min_hr_z:
+                        lift = min_hr_z - cur_z
+                        zt_a += lift
+                        zt_b += lift
+
+        seg_uv_poly = LineString([r_dir * sa + r_lat * w_mid, r_dir * sb + r_lat * w_mid]).buffer(0.045)
+        hr_z_lo = min(zt_a, zt_b) - hr_h
+        hr_z_hi = max(zt_a, zt_b)
+        for clv in fc.ceiling_levels:
+            if clv.polygon_uv.intersects(seg_uv_poly):
+                if hr_z_lo < clv.z_bottom + cfg.ceiling_thickness_m + 0.005 and hr_z_hi > clv.z_bottom - 0.005:
+                    return
+        if not is_sloped:
+            for flv in fc.floor_levels:
+                if flv.is_primary:
+                    continue
+                if flv.polygon_uv.intersects(seg_uv_poly):
+                    if hr_z_lo < flv.z_top + 0.005 and hr_z_hi > flv.z_top - cfg.floor_thickness_m - 0.005:
+                        return
+
+        p0_uvz = np.array([*(r_dir * sa + r_lat * w_mid), zt_a - 0.5 * hr_h], dtype=np.float64)
+        p1_uvz = np.array([*(r_dir * sb + r_lat * w_mid), zt_b - 0.5 * hr_h], dtype=np.float64)
+        p0_xyz = fc.frame.uvz_to_xyz(p0_uvz[None, :])[0]
+        p1_xyz = fc.frame.uvz_to_xyz(p1_uvz[None, :])[0]
+        axis_l = p1_xyz - p0_xyz
+        hr_len = float(np.linalg.norm(axis_l))
+        if hr_len < 0.55:
+            return
+        axis_l /= hr_len
+        lat_xyz = fc.frame.uvz_to_xyz(np.array([[r_lat[0], r_lat[1], 0.0]]))[0]
+        lat_xyz /= max(float(np.linalg.norm(lat_xyz)), 1e-9)
+        up_perp = np.cross(axis_l, lat_xyz)
+        up_perp /= max(float(np.linalg.norm(up_perp)), 1e-9)
+        if up_perp[2] < 0:
+            up_perp = -up_perp
+
+        hr_v, hr_t = make_oriented_box(
+            0.5 * (p0_xyz + p1_xyz),
+            axis_l,
+            lat_xyz,
+            up_perp,
+            (hr_len, hr_w, hr_h),
+        )
+        hr_pid = f"railing_{rail_group_idx:02d}_handrail"
+        parts.append(
+            MeshPart(
+                part_id=hr_pid,
+                class_id=14,
+                role="railing_handrail",
+                vertices=hr_v,
+                triangles=hr_t,
+                evidence_kind="measured",
+                metadata={
+                    "length_m": round(float(hr_len), 3),
+                    "z_ends": [round(float(zt_a), 4), round(float(zt_b), 4)],
+                    "sloped": bool(is_sloped),
+                    "host_flight_id": host_flight.part_id if host_flight is not None else None,
+                },
+            )
+        )
+
+        # Build open vertical balusters strictly anchored down onto stair treads or floor slabs (NEVER floating!)
+        bal_w = 0.04
+        slope_eff = abs(zt_b - zt_a) / max(sb - sa, 1e-6)
+        n_bal = max(2, int(np.floor((sb - sa) / 0.50)) + 1)
+        s_posts = np.linspace(sa + 0.05, sb - 0.05, n_bal)
+        bal_count = 0
+        z_min_post = min(zt_a, zt_b)
+        for b_idx, sp in enumerate(s_posts):
+            t_f = (sp - sa) / max(sb - sa, 1e-6)
+            uv_p = r_dir * sp + r_lat * w_mid
+            hr_bot_local = (
+                (zt_a + t_f * (zt_b - zt_a))
+                - hr_h * np.hypot(1.0, slope_eff)
+                - 0.015
+                - 0.5 * bal_w * slope_eff
+            )
+            b_corners = [
+                uv_p + r_dir * ds_c + r_lat * dw_c
+                for ds_c in (-0.5 * bal_w, 0.5 * bal_w)
+                for dw_c in (-0.5 * bal_w, 0.5 * bal_w)
+            ]
+            b_poly = Polygon(b_corners)
+
+            if host_flight is not None:
+                # Strictly anchor every stair baluster directly onto its supporting stair tread!
+                zb = max(host_flight.step_top_z_at(float(c[0]), float(c[1])) for c in b_corners) + 0.008
+            else:
+                zb = float(z_bot_fn(float(sp)))
+                # Snap horizontal guardrail posts down onto supporting floor level (within 0.45m)
+                for flv in fc.floor_levels:
+                    if flv.is_primary or flv.polygon_uv.buffer(0.08).intersects(b_poly):
+                        if abs(zb - flv.z_top) <= 0.45:
+                            zb = flv.z_top + 0.006
+                            break
+
+            for fl in flights:
+                if fl.poly_uv.buffer(0.015).intersects(b_poly):
+                    max_step_z = max(fl.step_top_z_at(float(c[0]), float(c[1])) for c in b_corners)
+                    zb = max(zb, max_step_z + 0.008)
+
+            for flv in fc.floor_levels:
+                if flv.is_primary:
+                    continue
+                if flv.polygon_uv.buffer(0.01).intersects(b_poly):
+                    fbot = flv.z_top - cfg.floor_thickness_m
+                    if zb < flv.z_top + 0.005 and hr_bot_local > fbot - 0.005:
+                        if hr_bot_local - flv.z_top > 0.25:
+                            zb = max(zb, flv.z_top + 0.006)
+                        else:
+                            hr_bot_local = min(hr_bot_local, fbot - 0.006)
+            for clv in fc.ceiling_levels:
+                if clv.polygon_uv.buffer(0.01).intersects(b_poly):
+                    ctop = clv.z_bottom + cfg.ceiling_thickness_m
+                    if zb < ctop + 0.005 and hr_bot_local > clv.z_bottom - 0.005:
+                        hr_bot_local = min(hr_bot_local, clv.z_bottom - 0.006)
+
+            bh = hr_bot_local - zb
+            if bh < 0.18:
                 continue
-            sub = rail_pts[comp]
+            z_min_post = min(z_min_post, zb)
+            c_xyz = fc.frame.uvz_to_xyz(np.array([[uv_p[0], uv_p[1], 0.5 * (zb + hr_bot_local)]]))[0]
+            dir_xyz = fc.frame.uvz_to_xyz(np.array([[r_dir[0], r_dir[1], 0.0]]))[0]
+            dir_xyz /= max(float(np.linalg.norm(dir_xyz)), 1e-9)
+            bv, bt = make_oriented_box(
+                c_xyz,
+                dir_xyz,
+                lat_xyz,
+                np.array([0.0, 0.0, 1.0]),
+                (bal_w, bal_w, bh),
+            )
+            parts.append(
+                MeshPart(
+                    part_id=f"railing_{rail_group_idx:02d}_post_{b_idx:02d}",
+                    class_id=14,
+                    role="railing_baluster",
+                    vertices=bv,
+                    triangles=bt,
+                    evidence_kind="measured",
+                    metadata={"z_span": [round(float(zb), 4), round(float(hr_bot_local), 4)]},
+                )
+            )
+            bal_count += 1
+
+        placed_rail_bands.append((seg_uv_poly, z_min_post, max(zt_a, zt_b)))
+        beam_blocker_bands.append((seg_uv_poly.buffer(0.02), z_min_post, max(zt_a, zt_b) + 0.05))
+        if is_sloped:
+            stair_well_cutouts.append((seg_uv_poly.buffer(0.03), z_min_post - 0.05, max(zt_a, zt_b) + 0.05))
+        railing_logs.append({
+            "group_id": f"railing_{rail_group_idx:02d}",
+            "length_m": round(float(hr_len), 3),
+            "baluster_count": int(bal_count),
+            "sloped": bool(is_sloped),
+            "host_flight_id": host_flight.part_id if host_flight is not None else None,
+            "z_ends": [round(float(zt_a), 4), round(float(zt_b), 4)],
+        })
+        rail_group_idx += 1
+
+    # Phase 2a: Unified dual-side continuous sloped stair handrails along every reconstructed flight
+    if len(rail_pts) >= 250 and flights:
+        for fl in flights:
+            s_r = rail_pts[:, :2] @ fl.run_dir
+            w_r = rail_pts[:, :2] @ fl.lat_dir
+            near_fl = (
+                (~consumed_rail_mask)
+                & (s_r >= fl.s_lo - 0.45)
+                & (s_r <= fl.s_hi + 0.45)
+                & (w_r >= fl.w_lo - 0.40)
+                & (w_r <= fl.w_hi + 0.40)
+            )
+            if int(np.sum(near_fl)) < 250:
+                continue
+            w_center = 0.5 * (fl.w_lo + fl.w_hi)
+            pitch_slope = (fl.z_hi - fl.z_lo) / max(fl.s_hi - fl.s_lo, 1e-6)
+
+            for side_idx, side_mask in (
+                (0, near_fl & (w_r <= w_center)),
+                (1, near_fl & (w_r > w_center)),
+            ):
+                if int(np.sum(side_mask)) < 250:
+                    continue
+                consumed_rail_mask |= side_mask
+                sub_s = s_r[side_mask]
+                sub_w = w_r[side_mask]
+                sub_z = rail_pts[side_mask, 2]
+                s_lo_r = max(fl.s_lo + 0.04, float(np.percentile(sub_s, 2)))
+                s_hi_r = min(fl.s_hi - 0.04, float(np.percentile(sub_s, 98)))
+                # Require meaningful span along flight (>= 30% of flight run) to avoid tiny stray clusters
+                if s_hi_r - s_lo_r < max(1.0, 0.30 * (fl.s_hi - fl.s_lo)):
+                    continue
+                # If evidence covers >= 40% of flight run, bridge scan-occlusion gaps cleanly along full flight run!
+                if s_hi_r - s_lo_r >= 0.40 * (fl.s_hi - fl.s_lo):
+                    s_lo_r = fl.s_lo + 0.06
+                    s_hi_r = fl.s_hi - 0.06
+
+                # Place rail cleanly inside the flight tread edge (inset 4cm from flight side edge) so balusters land squarely on treads!
+                w_target = fl.w_lo + 0.045 if side_idx == 0 else fl.w_hi - 0.045
+                w_meas = float(np.median(sub_w))
+                w_rail = float(np.clip(w_meas, fl.w_lo + 0.04, fl.w_hi - 0.04))
+                # Snap slightly inward if measured points were just outside the tread edge
+                if abs(w_meas - w_target) > 0.12:
+                    w_rail = w_target
+
+                # Measure constant handrail height above the flight pitch line (using 90th percentile in 0.5m bins)
+                pitch_z_pts = fl.z_lo + (sub_s - fl.s_lo) * pitch_slope
+                dz_above = sub_z - pitch_z_pts
+                h_rail = float(np.clip(np.percentile(dz_above, 88), 0.78, 1.12))
+
+                # Clip centerline inside room shell minus walls/columns
+                p_start = fl.run_dir * s_lo_r + fl.lat_dir * w_rail
+                p_end = fl.run_dir * s_hi_r + fl.lat_dir * w_rail
+                line = LineString([p_start, p_end]).intersection(rail_allowed_base)
+                segs = (
+                    list(line.geoms)
+                    if isinstance(line, MultiLineString)
+                    else ([line] if isinstance(line, LineString) else [])
+                )
+                if not segs:
+                    continue
+                # Keep the longest continuous clipped run (avoids fragmented stubs!)
+                best_seg = max(segs, key=lambda g: g.length)
+                if best_seg.length < 0.80:
+                    continue
+                c_pts = np.asarray(list(best_seg.coords), dtype=np.float64)
+                sa_raw = float(c_pts[0] @ fl.run_dir)
+                sb_raw = float(c_pts[-1] @ fl.run_dir)
+                sa, sb = min(sa_raw, sb_raw) + 0.02, max(sa_raw, sb_raw) - 0.02
+                zt_a = fl.z_lo + (sa - fl.s_lo) * pitch_slope + h_rail
+                zt_b = fl.z_lo + (sb - fl.s_lo) * pitch_slope + h_rail
+                if fc.ceiling_z is not None:
+                    zt_a = min(zt_a, fc.ceiling_z - 0.06)
+                    zt_b = min(zt_b, fc.ceiling_z - 0.06)
+
+                _emit_railing_run(
+                    fl.run_dir,
+                    fl.lat_dir,
+                    w_rail,
+                    sa,
+                    sb,
+                    zt_a,
+                    zt_b,
+                    lambda sv, _fl=fl: _fl.z_lo + (sv - _fl.s_lo) * pitch_slope,
+                    host_flight=fl,
+                )
+
+    # Phase 2b: Remaining non-flight horizontal guardrails (e.g. 2F mezzanine edge guardrails)
+    rem_rail = rail_pts[~consumed_rail_mask]
+    if len(rem_rail) >= 500:
+        r_comps = _voxel_connected_components_3d(rem_rail, voxel_size=0.18)
+        for comp in r_comps:
+            if len(comp) < 500:
+                continue
+            sub = rem_rail[comp]
             mean_uv = sub[:, :2].mean(axis=0)
             centered = sub[:, :2] - mean_uv
             cov = centered.T @ centered / max(len(sub), 1)
-            eigvals, eigvecs = np.linalg.eigh(cov)
+            _, eigvecs = np.linalg.eigh(cov)
             r_dir = _snap_dir_to_room_axis(eigvecs[:, 1], tol_deg=15.0)
             r_lat = np.array([-r_dir[1], r_dir[0]], dtype=np.float64)
 
             s_all = sub[:, :2] @ r_dir
             w_all = sub[:, :2] @ r_lat
             s_lo, s_hi = float(np.percentile(s_all, 2)), float(np.percentile(s_all, 98))
-            if s_hi - s_lo < 0.60:
+            if s_hi - s_lo < 0.80:
                 continue
             w_mid = float(np.median(w_all))
-
-            # Fit top handrail & bottom baluster envelope along 0.40m bins
-            n_bins = max(2, int(np.ceil((s_hi - s_lo) / 0.40)))
-            edges = np.linspace(s_lo, s_hi, n_bins + 1)
-            bin_s: list[float] = []
-            bin_zt: list[float] = []
-            bin_zb: list[float] = []
-            for bi in range(n_bins):
-                m = (s_all >= edges[bi]) & (s_all <= edges[bi + 1])
-                if int(np.sum(m)) >= 6:
-                    bin_s.append(0.5 * (edges[bi] + edges[bi + 1]))
-                    bin_zt.append(float(np.percentile(sub[m, 2], 92)))
-                    bin_zb.append(float(np.percentile(sub[m, 2], 8)))
-            if len(bin_s) < 2:
+            zt_med = float(np.percentile(sub[:, 2], 92))
+            zb_med = max(fc.floor_z + 0.008, float(np.percentile(sub[:, 2], 8)))
+            if zt_med - zb_med < 0.45:
                 continue
 
-            bs = np.asarray(bin_s, dtype=np.float64)
-            bzt = np.asarray(bin_zt, dtype=np.float64)
-            bzb = np.asarray(bin_zb, dtype=np.float64)
-            slope_t, inter_t = np.polyfit(bs, bzt, 1)
-            if abs(float(slope_t) * (s_hi - s_lo)) < 0.30:
-                slope_t = 0.0
-                inter_t = float(np.median(bzt))
-            slope_b, inter_b = np.polyfit(bs, bzb, 1)
-            if abs(float(slope_t)) < 1e-6:
-                slope_b = 0.0
-                inter_b = float(np.median(bzb))
-
-            def z_top_fn(sv: float, st: float = float(slope_t), it: float = float(inter_t)) -> float:
-                val = st * sv + it
-                if fc.ceiling_z is not None:
-                    val = min(val, fc.ceiling_z - 0.06)
-                return val
-
-            def z_bot_fn(sv: float, sb_: float = float(slope_b), ib_: float = float(inter_b)) -> float:
-                return max(fc.floor_z + 0.008, sb_ * sv + ib_)
-
-            z_cluster_lo = min(z_bot_fn(s_lo), z_bot_fn(s_hi))
-            z_cluster_hi = max(z_top_fn(s_lo), z_top_fn(s_hi))
-            if z_cluster_hi - z_cluster_lo < 0.35:
-                continue
-
-            # Subtract any already-placed railings overlapping in Z
             cur_rail_allowed = rail_allowed_base
             ov_rails = [
                 p.buffer(0.045)
                 for p, zb, zt in placed_rail_bands
-                if zb <= z_cluster_hi + 0.05 and zt >= z_cluster_lo - 0.05
+                if zb <= zt_med + 0.05 and zt >= zb_med - 0.05
             ]
             if ov_rails:
                 cur_rail_allowed = cur_rail_allowed.difference(unary_union(ov_rails)).buffer(0)
 
-            p_start = r_dir * s_lo + r_lat * w_mid
-            p_end = r_dir * s_hi + r_lat * w_mid
-            line = LineString([p_start, p_end]).intersection(cur_rail_allowed)
+            line = LineString([r_dir * s_lo + r_lat * w_mid, r_dir * s_hi + r_lat * w_mid]).intersection(cur_rail_allowed)
             segs = (
                 list(line.geoms)
                 if isinstance(line, MultiLineString)
                 else ([line] if isinstance(line, LineString) else [])
             )
-
             for seg in segs:
-                if seg.length < 0.50:
+                if seg.length < 0.70:
                     continue
                 c_pts = np.asarray(list(seg.coords), dtype=np.float64)
                 sa_raw = float(c_pts[0] @ r_dir)
                 sb_raw = float(c_pts[-1] @ r_dir)
                 sa, sb = min(sa_raw, sb_raw) + 0.02, max(sa_raw, sb_raw) - 0.02
-                if sb - sa < 0.45:
-                    continue
-
-                # Compute safe handrail endpoints strictly above stairs & clear of upper floor/ceiling slabs
-                hr_w = 0.055
-                hr_h = 0.055
-                zt_a = z_top_fn(sa)
-                zt_b = z_top_fn(sb)
-
-                # Ensure handrail stays strictly above any stair flight it crosses in XY
-                for t_frac in np.linspace(0.0, 1.0, 9):
-                    sc = sa + t_frac * (sb - sa)
-                    uv_c = r_dir * sc + r_lat * w_mid
-                    pt_c = Point(float(uv_c[0]), float(uv_c[1]))
-                    for fl in flights:
-                        if fl.poly_uv.buffer(0.04).contains(pt_c):
-                            min_hr_z = fl.step_top_z_at(float(uv_c[0]), float(uv_c[1])) + 0.12
-                            cur_z = zt_a + t_frac * (zt_b - zt_a)
-                            if cur_z < min_hr_z:
-                                lift = min_hr_z - cur_z
-                                zt_a += lift
-                                zt_b += lift
-
-                # Check if handrail box collides vertically with any upper floor slab or secondary ceiling
-                seg_uv_poly = LineString([r_dir * sa + r_lat * w_mid, r_dir * sb + r_lat * w_mid]).buffer(0.045)
-                hr_z_lo = min(zt_a, zt_b) - hr_h
-                hr_z_hi = max(zt_a, zt_b)
-                is_sloped = abs(zt_b - zt_a) >= 0.30
-                slab_clash = False
-                for clv in fc.ceiling_levels:
-                    if clv.polygon_uv.intersects(seg_uv_poly):
-                        if hr_z_lo < clv.z_bottom + cfg.ceiling_thickness_m + 0.005 and hr_z_hi > clv.z_bottom - 0.005:
-                            slab_clash = True
-                if not is_sloped:
-                    for flv in fc.floor_levels:
-                        if flv.is_primary:
-                            continue
-                        if flv.polygon_uv.intersects(seg_uv_poly):
-                            if hr_z_lo < flv.z_top + 0.005 and hr_z_hi > flv.z_top - cfg.floor_thickness_m - 0.005:
-                                slab_clash = True
-                if slab_clash:
-                    continue
-
-                # Build top handrail oriented box
-                p0_uvz = np.array([*(r_dir * sa + r_lat * w_mid), zt_a - 0.5 * hr_h], dtype=np.float64)
-                p1_uvz = np.array([*(r_dir * sb + r_lat * w_mid), zt_b - 0.5 * hr_h], dtype=np.float64)
-                p0_xyz = fc.frame.uvz_to_xyz(p0_uvz[None, :])[0]
-                p1_xyz = fc.frame.uvz_to_xyz(p1_uvz[None, :])[0]
-                axis_l = p1_xyz - p0_xyz
-                hr_len = float(np.linalg.norm(axis_l))
-                if hr_len < 0.45:
-                    continue
-                axis_l /= hr_len
-                lat_xyz = fc.frame.uvz_to_xyz(np.array([[r_lat[0], r_lat[1], 0.0]]))[0]
-                lat_xyz /= max(float(np.linalg.norm(lat_xyz)), 1e-9)
-                up_perp = np.cross(axis_l, lat_xyz)
-                up_perp /= max(float(np.linalg.norm(up_perp)), 1e-9)
-                if up_perp[2] < 0:
-                    up_perp = -up_perp
-
-                hr_v, hr_t = make_oriented_box(
-                    0.5 * (p0_xyz + p1_xyz),
-                    axis_l,
-                    lat_xyz,
-                    up_perp,
-                    (hr_len, hr_w, hr_h),
+                _emit_railing_run(
+                    r_dir,
+                    r_lat,
+                    w_mid,
+                    sa,
+                    sb,
+                    zt_med,
+                    zt_med,
+                    lambda _sv, _zb=zb_med: _zb,
+                    host_flight=None,
                 )
-                hr_pid = f"railing_{rail_group_idx:02d}_handrail"
-                parts.append(
-                    MeshPart(
-                        part_id=hr_pid,
-                        class_id=14,
-                        role="railing_handrail",
-                        vertices=hr_v,
-                        triangles=hr_t,
-                        evidence_kind="measured",
-                        metadata={
-                            "length_m": round(float(hr_len), 3),
-                            "z_ends": [round(float(zt_a), 4), round(float(zt_b), 4)],
-                            "sloped": bool(abs(float(zt_b) - float(zt_a)) >= 0.30),
-                        },
-                    )
-                )
-
-                # Build open vertical balusters strictly below the handrail bar (zero penetration!)
-                bal_w = 0.04
-                slope_eff = abs(zt_b - zt_a) / max(sb - sa, 1e-6)
-                n_bal = max(2, int(np.floor((sb - sa) / 0.45)) + 1)
-                s_posts = np.linspace(sa + 0.04, sb - 0.04, n_bal)
-                bal_count = 0
-                for b_idx, sp in enumerate(s_posts):
-                    t_f = (sp - sa) / max(sb - sa, 1e-6)
-                    uv_p = r_dir * sp + r_lat * w_mid
-                    # Generous top clearance below sloped handrail bottom
-                    hr_bot_local = (zt_a + t_f * (zt_b - zt_a)) - hr_h * np.hypot(1.0, slope_eff) - 0.015 - 0.5 * bal_w * slope_eff
-                    zb = z_bot_fn(float(sp))
-
-                    # Lift baluster bottom strictly above any overlapping stair step tread!
-                    b_corners = [
-                        uv_p + r_dir * ds_c + r_lat * dw_c
-                        for ds_c in (-0.5 * bal_w, 0.5 * bal_w)
-                        for dw_c in (-0.5 * bal_w, 0.5 * bal_w)
-                    ]
-                    b_poly = Polygon(b_corners)
-                    for fl in flights:
-                        if fl.poly_uv.buffer(0.015).intersects(b_poly):
-                            max_step_z = max(fl.step_top_z_at(float(c[0]), float(c[1])) for c in b_corners)
-                            zb = max(zb, max_step_z + 0.010)
-
-                    # Keep baluster clear of upper floor slabs & secondary ceilings
-                    for flv in fc.floor_levels:
-                        if flv.is_primary:
-                            continue
-                        if flv.polygon_uv.buffer(0.01).intersects(b_poly):
-                            fbot = flv.z_top - cfg.floor_thickness_m
-                            if zb < flv.z_top + 0.005 and hr_bot_local > fbot - 0.005:
-                                if hr_bot_local - flv.z_top > 0.25:
-                                    zb = max(zb, flv.z_top + 0.006)
-                                else:
-                                    hr_bot_local = min(hr_bot_local, fbot - 0.006)
-                    for clv in fc.ceiling_levels:
-                        if clv.polygon_uv.buffer(0.01).intersects(b_poly):
-                            ctop = clv.z_bottom + cfg.ceiling_thickness_m
-                            if zb < ctop + 0.005 and hr_bot_local > clv.z_bottom - 0.005:
-                                hr_bot_local = min(hr_bot_local, clv.z_bottom - 0.006)
-
-                    bh = hr_bot_local - zb
-                    if bh < 0.18:
-                        continue
-                    c_xyz = fc.frame.uvz_to_xyz(np.array([[uv_p[0], uv_p[1], 0.5 * (zb + hr_bot_local)]]))[0]
-                    dir_xyz = fc.frame.uvz_to_xyz(np.array([[r_dir[0], r_dir[1], 0.0]]))[0]
-                    dir_xyz /= max(float(np.linalg.norm(dir_xyz)), 1e-9)
-                    bv, bt = make_oriented_box(
-                        c_xyz,
-                        dir_xyz,
-                        lat_xyz,
-                        np.array([0.0, 0.0, 1.0]),
-                        (bal_w, bal_w, bh),
-                    )
-                    parts.append(
-                        MeshPart(
-                            part_id=f"railing_{rail_group_idx:02d}_post_{b_idx:02d}",
-                            class_id=14,
-                            role="railing_baluster",
-                            vertices=bv,
-                            triangles=bt,
-                            evidence_kind="measured",
-                            metadata={"z_span": [round(zb, 4), round(hr_bot_local, 4)]},
-                        )
-                    )
-                    bal_count += 1
-
-                placed_rail_bands.append((seg_uv_poly, z_cluster_lo, max(zt_a, zt_b)))
-                beam_blocker_bands.append((seg_uv_poly.buffer(0.02), z_cluster_lo, max(zt_a, zt_b) + 0.05))
-                if is_sloped:
-                    # A sloped stair railing passes through the stairwell opening — include it in stairwell cutout!
-                    stair_well_cutouts.append((seg_uv_poly.buffer(0.03), z_cluster_lo - 0.05, max(zt_a, zt_b) + 0.05))
-                railing_logs.append({
-                    "group_id": f"railing_{rail_group_idx:02d}",
-                    "length_m": round(float(hr_len), 3),
-                    "baluster_count": int(bal_count),
-                    "sloped": bool(abs(float(zt_b) - float(zt_a)) >= 0.30),
-                    "z_ends": [round(float(zt_a), 4), round(float(zt_b), 4)],
-                })
-                rail_group_idx += 1
 
     emitted_stairs = len(flights)
     emitted_rails = sum(1 for p in parts if p.class_id == 14)
