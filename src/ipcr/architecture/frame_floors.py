@@ -176,8 +176,12 @@ def _detect_z_peaks(
 
 
 def _raster_mask_to_polygon(mask: np.ndarray, u0: float, v0: float, cell: float) -> Polygon:
-    """Convert a 2D boolean raster mask (no interior holes) into a clean Shapely Polygon."""
+    """Convert a 2D boolean raster mask (no interior holes, no thin noise whiskers) into a clean Shapely Polygon."""
     filled = ndimage.binary_fill_holes(mask)
+    # Remove 1-2 cell thin noise whiskers/spikes poking outside the room while preserving real alcoves (>=0.3m wide)
+    opened = ndimage.binary_opening(filled, structure=np.ones((3, 3), dtype=bool), iterations=1)
+    if np.any(opened):
+        filled = ndimage.binary_fill_holes(opened)
     labeled, ncomp = ndimage.label(filled)
     if ncomp == 0:
         raise ValueError("Empty floor raster mask")
@@ -429,6 +433,133 @@ def _refine_footprint_edges_to_walls(
     return orient(Polygon(refined.exterior.coords), sign=1.0), edge_logs
 
 
+def _square_spurious_corner_bevels(
+    poly_uv: Polygon,
+    wall_uvz: np.ndarray,
+    *,
+    max_bevel_len_m: float = 1.40,
+    min_flank_len_m: float = 0.90,
+) -> tuple[Polygon, int]:
+    """Replace spurious diagonal corner chamfers (caused by corner clutter/scan shadows) with exact 90-deg corners.
+
+    A genuine 45-degree architectural wall has substantial wall points strictly along the diagonal
+    face away from the extrapolated orthogonal walls and is preserved untouched.
+    """
+    coords = np.asarray(list(orient(poly_uv, sign=1.0).exterior.coords)[:-1], dtype=np.float64)
+    if len(coords) < 5 or len(wall_uvz) < 200:
+        return poly_uv, 0
+
+    wall_uv = wall_uvz[:, :2]
+    squared_count = 0
+
+    for _ in range(6):
+        n = len(coords)
+        if n < 5:
+            break
+        changed = False
+        for i in range(n):
+            p_prev = coords[(i - 1) % n]
+            p0 = coords[i]
+            p1 = coords[(i + 1) % n]
+            p_next = coords[(i + 2) % n]
+
+            e_prev = p0 - p_prev
+            e_cur = p1 - p0
+            e_next = p_next - p1
+            l_prev = float(np.linalg.norm(e_prev))
+            l_cur = float(np.linalg.norm(e_cur))
+            l_next = float(np.linalg.norm(e_next))
+
+            if l_cur > max_bevel_len_m or l_prev < min_flank_len_m or l_next < min_flank_len_m:
+                continue
+            t_prev = e_prev / l_prev
+            t_cur = e_cur / max(l_cur, 1e-9)
+            t_next = e_next / l_next
+
+            # Check if flanking edges are nearly perpendicular (forming a real 90-deg corner)
+            if abs(float(np.dot(t_prev, t_next))) > 0.22:
+                continue
+            # Check if current short edge is diagonal relative to its flanking walls
+            ang_prev = abs(float(np.dot(t_cur, t_prev)))
+            ang_next = abs(float(np.dot(t_cur, t_next)))
+            if max(ang_prev, ang_next) > 0.95:
+                continue
+
+            # Solve exact intersection of extended flanking wall lines
+            n_prev = np.array([t_prev[1], -t_prev[0]], dtype=np.float64)
+            n_next = np.array([t_next[1], -t_next[0]], dtype=np.float64)
+            a_mat = np.vstack([n_prev, n_next])
+            det = float(np.linalg.det(a_mat))
+            if abs(det) < 0.25:
+                continue
+            c_prev = float(np.dot(p0, n_prev))
+            c_next = float(np.dot(p1, n_next))
+            p_corner = np.linalg.solve(a_mat, np.array([c_prev, c_next], dtype=np.float64))
+            if float(np.linalg.norm(p_corner - p0)) > max_bevel_len_m * 1.3 or float(np.linalg.norm(p_corner - p1)) > max_bevel_len_m * 1.3:
+                continue
+
+            # Compare wall evidence on the diagonal face vs wall evidence continuing along the
+            # two extrapolated 90-degree corner legs [p0 -> p_corner] and [p_corner -> p1]!
+            # Scale-invariant: handles both sparse synthetic clouds and 26M-pt LiDAR scans cleanly.
+            n_cur = np.array([t_cur[1], -t_cur[0]], dtype=np.float64)
+            rel_cur = wall_uv - p0[None, :]
+            s_cur = rel_cur @ t_cur
+            d_cur = np.abs(rel_cur @ n_cur)
+            on_diag = (s_cur >= 0.08) & (s_cur <= l_cur - 0.08) & (d_cur <= 0.10)
+            if int(np.sum(on_diag)) > 0:
+                sub_uv = wall_uv[on_diag]
+                d_to_prev = np.abs(sub_uv @ n_prev - c_prev)
+                d_to_next = np.abs(sub_uv @ n_next - c_next)
+                strictly_diag_pts = int(np.sum((d_to_prev > 0.14) & (d_to_next > 0.14)))
+            else:
+                strictly_diag_pts = 0
+
+            leg1_len = float(np.linalg.norm(p_corner - p0))
+            leg2_len = float(np.linalg.norm(p1 - p_corner))
+            rel1 = wall_uv - p0[None, :]
+            s1 = rel1 @ t_prev
+            d1 = np.abs(rel1 @ n_prev)
+            on_leg1 = int(np.sum((s1 >= 0.05) & (s1 <= leg1_len + 0.08) & (d1 <= 0.12)))
+
+            rel2 = wall_uv - p_corner[None, :]
+            s2 = rel2 @ t_next
+            d2 = np.abs(rel2 @ n_next)
+            on_leg2 = int(np.sum((s2 >= -0.08) & (s2 <= leg2_len - 0.05) & (d2 <= 0.12)))
+            orth_corner_pts = on_leg1 + on_leg2
+
+            # Preserve diagonal ONLY if it has genuine standalone diagonal wall support and NOT dominated by 90-deg corner walls
+            if strictly_diag_pts >= 400 and orth_corner_pts < strictly_diag_pts * 1.5:
+                continue
+
+            # Replace p0 and p1 with the single crisp 90-degree corner p_corner
+            j = (i + 1) % n
+            if j > i:
+                new_list = [coords[k] for k in range(n) if k not in (i, j)]
+                new_list.insert(i, p_corner)
+            else:
+                # Wrap-around edge (i == n-1, j == 0)
+                new_list = [p_corner] + [coords[k] for k in range(1, n - 1)]
+            cand = Polygon(new_list).buffer(0)
+            if isinstance(cand, MultiPolygon):
+                cand = max(cand.geoms, key=lambda g: g.area)
+            if not cand.is_empty and cand.area >= poly_uv.area * 0.90:
+                coords = np.asarray(list(orient(cand, sign=1.0).exterior.coords)[:-1], dtype=np.float64)
+                squared_count += 1
+                changed = True
+                break
+        if not changed:
+            break
+
+    # Also collapse tiny collinear/micro-step vertices (< 0.09 m) produced during snapping
+    cleaned = _remove_small_raster_jogs(coords, max_jog_m=0.12, min_neighbor_m=0.80)
+    final_poly = Polygon(cleaned).buffer(0)
+    if isinstance(final_poly, MultiPolygon):
+        final_poly = max(final_poly.geoms, key=lambda g: g.area)
+    if final_poly.is_empty or final_poly.area < poly_uv.area * 0.90:
+        return orient(poly_uv, sign=1.0), squared_count
+    return orient(Polygon(final_poly.exterior.coords), sign=1.0), squared_count
+
+
 def analyze_floor_and_ceiling(
     points_local: np.ndarray,
     work_labels: np.ndarray,
@@ -516,8 +647,13 @@ def analyze_floor_and_ceiling(
     nu = int(np.ceil((u1 - u0) / cell)) + 2
     nv = int(np.ceil((v1 - v0) / cell)) + 2
 
-    floor_band = floor_pts[np.abs(floor_pts[:, 2] - floor_z) <= 0.18]
-    col_pts = uvz[(work_labels == 4) & (uvz[:, 2] >= floor_z - 0.10) & (uvz[:, 2] <= floor_z + 2.5)]
+    # Capture full 1F floor extent (allowing up to +-0.35m for slight SLAM tilt or 1-2 step raised vestibules,
+    # while rejecting >=0.40m windowsill ledges and staying safely below any 2F floor level!)
+    floor_upper_band = floor_z + 0.35
+    if len(floor_peaks) >= 2:
+        floor_upper_band = min(floor_upper_band, 0.5 * (floor_z + float(floor_peaks[1][0])))
+    floor_band = floor_pts[(floor_pts[:, 2] >= floor_z - 0.35) & (floor_pts[:, 2] <= floor_upper_band)]
+    col_pts = uvz[(work_labels == 4) & (uvz[:, 2] >= floor_z - 0.15) & (uvz[:, 2] <= floor_z + 2.5)]
     stair_pts = uvz[work_labels == 13]
 
     grid = np.zeros((nu, nv), dtype=bool)
@@ -534,6 +670,9 @@ def analyze_floor_and_ceiling(
 
     wall_uvz = uvz[work_labels == 2]
     snapped_poly, edge_logs = _refine_footprint_edges_to_walls(ortho_poly, wall_uvz)
+    snapped_poly, squared_bevels = _square_spurious_corner_bevels(snapped_poly, wall_uvz)
+    if squared_bevels > 0:
+        snapped_poly, edge_logs = _refine_footprint_edges_to_walls(snapped_poly, wall_uvz)
 
     # Assemble structured floor_levels (Level 0 = snapped primary footprint, Level k>=1 = upper mezzanines)
     floor_levels: list[FloorLevel] = [
@@ -598,6 +737,7 @@ def analyze_floor_and_ceiling(
             "raw_floor_area_m2": round(float(raw_poly.area), 3),
             "snapped_inner_area_m2": round(float(snapped_poly.area), 3),
             "footprint_vertex_count": len(list(snapped_poly.exterior.coords)) - 1,
+            "squared_corner_bevels": squared_bevels,
             "edge_snapping": edge_logs,
         },
     )

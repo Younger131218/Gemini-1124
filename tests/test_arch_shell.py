@@ -129,3 +129,50 @@ def test_rotated_room_closed_shell_with_window_door_column_beam_and_scan_shadow(
     assert cm["1"]["cloud_to_mesh_within_10cm"] >= 0.98
     assert cm["2"]["cloud_to_mesh_within_10cm"] >= 0.90
     assert cm["11"]["cloud_to_mesh_within_10cm"] >= 0.98
+
+
+def test_corner_shadow_bevel_squared_and_raised_alcove_included(tmp_path: Path) -> None:
+    # 6m x 5m room with:
+    # 1. A 0.75m x 0.75m floor scan shadow right in the NE corner (x>5.25, y>4.25) while walls meet at sharp (6,5)
+    #    -> must produce a sharp 90-degree corner (no spurious 45-degree chamfer!)
+    # 2. A slightly raised (+0.28m) 2m x 2m entry alcove on south wall (x in [0, 2], y in [-2, 0])
+    #    -> must be included in the footprint (not omitted by tight floor Z band!)
+    f_main = _grid_xy(0.0, 6.0, 0.0, 5.0, z=0.0, step=0.08)
+    # Remove floor points in NE corner triangle (simulating clutter/scan shadow)
+    corner_shadow = (f_main[:, 0] + f_main[:, 1]) > 10.15
+    f_main = f_main[~corner_shadow]
+    f_alcove = _grid_xy(0.0, 2.0, -2.0, 0.0, z=0.28, step=0.08)
+    floor = np.vstack([f_main, f_alcove])
+
+    ceil = np.vstack([
+        _grid_xy(0.0, 6.0, 0.0, 5.0, z=3.2, step=0.08),
+        _grid_xy(0.0, 2.0, -2.0, 0.0, z=3.2, step=0.08),
+    ])
+
+    walls = np.vstack([
+        _grid_wall_x(0.0, 2.0, -2.0, 0.28, 3.2),
+        _grid_wall_y(2.0, -2.0, 0.0, 0.28, 3.2),
+        _grid_wall_x(2.0, 6.0, 0.0, 0.0, 3.2),
+        _grid_wall_y(6.0, 0.0, 5.0, 0.0, 3.2),
+        _grid_wall_x(0.0, 6.0, 5.0, 0.0, 3.2),
+        _grid_wall_y(0.0, -2.0, 5.0, 0.0, 3.2),
+    ])
+
+    pts = np.vstack([floor, ceil, walls])
+    cls = np.concatenate([
+        np.full(len(floor), 1),
+        np.full(len(ceil), 0),
+        np.full(len(walls), 2),
+    ])
+    las_file = tmp_path / "synth_corner_alcove.las"
+    _write_las(las_file, pts, cls)
+    out_dir = tmp_path / "out_ca"
+    report = run_arch_pipeline(las_file, out_dir, render_preview=False)
+
+    assert report["status"] == "PASS", report
+    assert report["relation_audit"]["unexpected_penetration_count"] == 0
+    fc_aud = report["architecture"]["floor_ceiling"]
+    # True inner area = 6*5 + 2*2 = 34.0 m^2 (if alcove dropped -> 30 m^2; if corner chamfered -> < 33.4 m^2)
+    assert fc_aud["snapped_inner_area_m2"] >= 33.2, fc_aud
+    # Exact L-shape has 6 vertices (no extra diagonal chamfer edge!)
+    assert fc_aud["footprint_vertex_count"] <= 7, fc_aud
