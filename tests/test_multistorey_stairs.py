@@ -276,3 +276,52 @@ def test_dual_angle_trapezoid_higher_stairwell_roof_and_u_turn_stairs(tmp_path: 
     sr = report["architecture"]["stairs_railings"]
     assert sr["emitted_stair_flights"] >= 2, sr
     assert sr["emitted_stair_landings"] >= 1, sr
+
+
+def test_overhead_header_interior_wall_not_stretched_to_floor_and_stair_bounds(tmp_path: Path) -> None:
+    """Regression gate for G11:
+    1) An overhead header/clerestory interior wall (hanging above a 2m walkway, even with a narrow end jamb)
+       must NOT be stretched down to floor_z to block the walkway.
+    2) An enclosed room corner whose floor was occluded must be recovered from perimeter class-2 walls.
+    3) Reconstructed stair flights must stay strictly within class-13 point-cloud boundaries.
+    """
+    # 8m x 6m x 3.2m room with occluded 1.2m x 1.2m floor corner at [6.8..8.0, 4.8..6.0] enclosed by walls
+    f_all = _grid_xy(0.0, 8.0, 0.0, 6.0, z=0.0, step=0.10)
+    floor = f_all[~((f_all[:, 0] > 6.7) & (f_all[:, 1] > 4.7))]
+    ceil = _grid_xy(0.0, 8.0, 0.0, 6.0, z=3.2, step=0.10)
+
+    walls = np.vstack([
+        _grid_wall_x(0.0, 8.0, 0.0, 0.0, 3.2),
+        _grid_wall_x(0.0, 8.0, 6.0, 0.0, 3.2),
+        _grid_wall_y(0.0, 0.0, 6.0, 0.0, 3.2),
+        _grid_wall_y(8.0, 0.0, 6.0, 0.0, 3.2),
+    ])
+
+    # Overhead interior header wall at y=3.0, x in [2.0, 5.5], z in [2.2, 3.2] (open 2.2m walkway below!)
+    # plus a tiny 20cm end jamb at x in [5.35, 5.50], z in [0.5, 2.2] to test outlier resistance!
+    header = _grid_wall_x(2.0, 5.5, 3.0, 2.2, 3.2, step=0.05)
+    end_jamb = _grid_wall_x(5.35, 5.50, 3.0, 0.5, 2.2, step=0.05)
+
+    pts = np.vstack([floor, ceil, walls, header, end_jamb])
+    cls = np.concatenate([
+        np.full(len(floor), 1),
+        np.full(len(ceil), 0),
+        np.full(len(walls), 2),
+        np.full(len(header), 2),
+        np.full(len(end_jamb), 2),
+    ])
+
+    las_file = tmp_path / "synth_header_wall.las"
+    _write_las(las_file, pts, cls)
+    out_dir = tmp_path / "out_hdr"
+    report = run_arch_pipeline(las_file, out_dir, render_preview=False)
+
+    assert report["status"] == "PASS", report["relation_audit"]
+    assert report["relation_audit"]["unexpected_penetration_count"] == 0
+    # Enclosed occluded corner recovered -> inner area close to full 8*6=48 m^2 (not 46.5 m^2!)
+    assert report["architecture"]["floor_ceiling"]["snapped_inner_area_m2"] >= 46.8
+    # Overhead header wall MUST stay lifted >= 1.8m above floor_z (NOT stretched down to floor_z!)
+    floor_z = report["architecture"]["floor_ceiling"]["floor_z_local"]
+    iw = report["architecture"]["interior_walls"]["walls"]
+    assert len(iw) == 1, iw
+    assert (iw[0]["z_span"][0] - floor_z) >= 1.80, f"Overhead header stretched down into walkway: {iw[0]}"

@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
+from scipy import ndimage
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon, box
 from shapely.geometry.polygon import orient
 from shapely.ops import unary_union
 
@@ -330,6 +331,48 @@ def _local_ceiling_above_poly(poly_uv: Polygon, fc: FloorCeilingResult) -> float
     return fc.ceiling_z
 
 
+def _build_cloud_footprint_uv(
+    pts_uv: np.ndarray,
+    *,
+    cell: float = 0.10,
+    pad_m: float = 0.08,
+    close_iters: int = 1,
+) -> Polygon | MultiPolygon | None:
+    """Build exact 2D point-cloud occupancy polygon in UV space (G10b strict boundary containment).
+
+    Guarantees reconstructed stairs and landings NEVER protrude more than `pad_m` outside real class-13 points!
+    """
+    if len(pts_uv) < 40:
+        return None
+    u0 = float(pts_uv[:, 0].min()) - 2.0 * cell
+    v0 = float(pts_uv[:, 1].min()) - 2.0 * cell
+    u1 = float(pts_uv[:, 0].max()) + 2.0 * cell
+    v1 = float(pts_uv[:, 1].max()) + 2.0 * cell
+    nu = int(np.ceil((u1 - u0) / cell)) + 2
+    nv = int(np.ceil((v1 - v0) / cell)) + 2
+    if nu > 400 or nv > 400:
+        return None
+    counts = np.zeros((nu, nv), dtype=np.int32)
+    iu = np.clip(np.floor((pts_uv[:, 0] - u0) / cell).astype(np.int64), 0, nu - 1)
+    iv = np.clip(np.floor((pts_uv[:, 1] - v0) / cell).astype(np.int64), 0, nv - 1)
+    np.add.at(counts, (iu, iv), 1)
+    mask = counts >= 2
+    if close_iters > 0:
+        mask = ndimage.binary_closing(mask, structure=np.ones((3, 3), dtype=bool), iterations=close_iters)
+    mask = ndimage.binary_fill_holes(mask)
+    ys, xs = np.nonzero(mask.T)  # xs=iu, ys=iv
+    if len(xs) == 0:
+        return None
+    rects = [
+        box(u0 + int(ix) * cell, v0 + int(iy) * cell, u0 + (int(ix) + 1) * cell, v0 + (int(iy) + 1) * cell)
+        for ix, iy in zip(xs, ys)
+    ]
+    poly = unary_union(rects).buffer(pad_m).buffer(0)
+    if poly.is_empty:
+        return None
+    return poly
+
+
 def _fit_and_build_flight(
     sub_uvz: np.ndarray,
     fc: FloorCeilingResult,
@@ -375,7 +418,13 @@ def _fit_and_build_flight(
     if z_hi - z_lo < 0.40:
         return None
 
-    inscribed = _inscribe_sw_rect(s_lo, s_hi, w_lo, w_hi, run_dir, lat_dir, allowed_xy)
+    # G10b: Strictly constrain flight rectangle inside BOTH room clearance AND actual class-13 point cloud footprint!
+    cloud_dom = _build_cloud_footprint_uv(sub_uvz[:, :2], cell=0.10, pad_m=0.08, close_iters=1)
+    effective_allowed = allowed_xy.intersection(cloud_dom).buffer(0) if cloud_dom is not None else allowed_xy
+    if effective_allowed.is_empty:
+        return None
+
+    inscribed = _inscribe_sw_rect(s_lo, s_hi, w_lo, w_hi, run_dir, lat_dir, effective_allowed)
     if inscribed is None:
         return None
     s_lo, s_hi, w_lo, w_hi = inscribed
@@ -456,7 +505,10 @@ def _build_stair_landing(
         return None
 
     rect = _sw_rect_poly(s_lo, s_hi, w_lo, w_hi, r_dir, l_dir)
+    land_cloud_dom = _build_cloud_footprint_uv(land_pts[:, :2], cell=0.10, pad_m=0.10, close_iters=1)
     clipped = rect.intersection(allowed_xy)
+    if land_cloud_dom is not None:
+        clipped = clipped.intersection(land_cloud_dom)
     clipped = clipped.difference(unary_union([fl1.poly_uv.buffer(0.006), fl2.poly_uv.buffer(0.006)])).buffer(0)
     geoms = (
         list(clipped.geoms)
@@ -935,20 +987,31 @@ def build_stairs_and_railings(
                 s_lo_r = max(fl.s_lo + 0.04, float(np.percentile(sub_s, 2)))
                 s_hi_r = min(fl.s_hi - 0.04, float(np.percentile(sub_s, 98)))
                 # Require meaningful span along flight (>= 30% of flight run) to avoid tiny stray clusters
-                if s_hi_r - s_lo_r < max(1.0, 0.30 * (fl.s_hi - fl.s_lo)):
+                if s_hi_r - s_lo_r < max(0.85, 0.30 * (fl.s_hi - fl.s_lo)):
                     continue
-                # If evidence covers >= 40% of flight run, bridge scan-occlusion gaps cleanly along full flight run!
-                if s_hi_r - s_lo_r >= 0.40 * (fl.s_hi - fl.s_lo):
+                # Only bridge full flight run when railing points ALREADY span >= 70% of the flight (never extrapolate into open air!)
+                if s_hi_r - s_lo_r >= 0.70 * (fl.s_hi - fl.s_lo):
                     s_lo_r = fl.s_lo + 0.06
                     s_hi_r = fl.s_hi - 0.06
 
-                # Place rail cleanly inside the flight tread edge (inset 4cm from flight side edge) so balusters land squarely on treads!
+                # Place rail strictly at the measured class-14 lateral coordinate (NEVER teleport away from real railing points!)
                 w_target = fl.w_lo + 0.045 if side_idx == 0 else fl.w_hi - 0.045
                 w_meas = float(np.median(sub_w))
-                w_rail = float(np.clip(w_meas, fl.w_lo + 0.04, fl.w_hi - 0.04))
-                # Snap slightly inward if measured points were just outside the tread edge
-                if abs(w_meas - w_target) > 0.12:
-                    w_rail = w_target
+                if abs(w_meas - w_target) > 0.35:
+                    continue
+                w_rail = float(np.clip(w_meas, fl.w_lo + 0.035, fl.w_hi - 0.035))
+
+                # Verify real class-14 point-cloud bin coverage along [s_lo_r, s_hi_r] (>=55% of 0.35m bins occupied)
+                n_rbins = max(3, int(round((s_hi_r - s_lo_r) / 0.35)))
+                rb_edges = np.linspace(s_lo_r, s_hi_r, n_rbins + 1)
+                near_lat = np.abs(sub_w - w_rail) <= 0.28
+                occ_bins = sum(
+                    1
+                    for k in range(n_rbins)
+                    if int(np.sum(near_lat & (sub_s >= rb_edges[k]) & (sub_s <= rb_edges[k + 1]))) >= 5
+                )
+                if occ_bins / n_rbins < 0.55:
+                    continue
 
                 # Measure constant handrail height above the flight pitch line (using 88th percentile)
                 pitch_z_pts = fl.z_lo + (sub_s - fl.s_lo) * pitch_slope

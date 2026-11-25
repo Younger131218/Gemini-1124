@@ -12,7 +12,7 @@ from shapely.ops import unary_union
 
 from ipcr.architecture.frame_floors import FloorCeilingResult
 from ipcr.config import ArchitectureConfig
-from ipcr.geometry_primitives import extrude_polygon_solid, make_oriented_box
+from ipcr.geometry_primitives import extrude_polygon_solid, make_oriented_box, signed_mesh_volume
 from ipcr.types import MeshPart, WallSegment
 from ipcr.working_labels import _extract_dominant_vertical_wall_planes, _voxel_connected_components_3d
 
@@ -423,6 +423,129 @@ def build_exterior_wall_parts(
     return parts
 
 
+def _extrude_wall_sz_profile(
+    fc: FloorCeilingResult,
+    origin_uv: np.ndarray,
+    t_dir: np.ndarray,
+    n_dir: np.ndarray,
+    d_lo: float,
+    d_hi: float,
+    profile_sz: Polygon,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extrude a 2D (s, z) wall side-elevation polygon across wall thickness [d_lo, d_hi]."""
+    prof = orient(profile_sz.buffer(0), sign=1.0)
+    if isinstance(prof, MultiPolygon):
+        prof = max(prof.geoms, key=lambda g: g.area)
+    v_szd, tri = extrude_polygon_solid(prof, d_lo, d_hi)
+    s_val = v_szd[:, 0]
+    z_val = v_szd[:, 1]
+    d_val = v_szd[:, 2]
+    uv = origin_uv[None, :] + s_val[:, None] * t_dir[None, :] + d_val[:, None] * n_dir[None, :]
+    v_xyz = fc.frame.uvz_to_xyz(np.column_stack([uv, z_val]))
+    if signed_mesh_volume(v_xyz, tri) < 0:
+        tri = tri[:, [0, 2, 1]]
+    return v_xyz, tri
+
+
+def _build_stepped_wall_profile_sz(
+    s_vals: np.ndarray,
+    z_vals: np.ndarray,
+    s_lo: float,
+    s_hi: float,
+    z_floor_snap: float,
+    z_ceil_snap: float,
+    *,
+    bin_w: float = 0.28,
+    min_bin_pts: int = 35,
+    snap_floor_tol: float = 0.35,
+    snap_ceil_tol: float = 0.30,
+) -> tuple[Polygon | None, float, float, bool]:
+    """Build a crisp simplified 2D (s, z) side-elevation profile polygon for an irregular/stepped/sloped wall.
+
+    Returns (profile_poly_sz, z_min_eff, z_max_eff, is_irregular).
+    - If the wall has a nearly uniform rectangular profile across its span, returns is_irregular=False.
+    - If the wall is an overhead header/clerestory wall (lifted bottom) or has a sloped/stepped top/bottom
+      (e.g. under-stairs triangular spandrel wall or stairwell step-wall), returns a clean simplified polygon!
+    """
+    span = s_hi - s_lo
+    if span < 0.35 or len(s_vals) < 100:
+        return None, 0.0, 0.0, False
+    n_bins = max(3, int(round(span / bin_w)))
+    edges = np.linspace(s_lo, s_hi, n_bins + 1)
+    bin_s: list[float] = []
+    bin_zlo: list[float] = []
+    bin_zhi: list[float] = []
+    for k in range(n_bins):
+        m = (s_vals >= edges[k]) & (s_vals <= edges[k + 1])
+        if int(np.sum(m)) < min_bin_pts:
+            continue
+        zb = z_vals[m]
+        zl = float(np.percentile(zb, 4))
+        zh = float(np.percentile(zb, 96))
+        if zh - zl < 0.22:
+            continue
+        bin_s.append(0.5 * float(edges[k] + edges[k + 1]))
+        bin_zlo.append(zl)
+        bin_zhi.append(zh)
+
+    if len(bin_s) < 2:
+        return None, 0.0, 0.0, False
+
+    zlo_arr = np.asarray(bin_zlo, dtype=np.float64)
+    zhi_arr = np.asarray(bin_zhi, dtype=np.float64)
+
+    # Guard against a single narrow end-jamb/post dragging an overhead header wall down to the floor:
+    # If >=70% of bins share a lifted bottom (> median_zlo - 0.30) while <=20% end bins dip sharply lower (>0.60m),
+    # clip those end-jamb outliers to the header's true bottom so we don't block an open doorway/walkway!
+    med_zlo = float(np.median(zlo_arr))
+    med_zhi = float(np.median(zhi_arr))
+    high_bot_frac = float(np.mean(zlo_arr >= med_zlo - 0.25))
+    if high_bot_frac >= 0.70 and med_zlo > z_floor_snap + 0.55:
+        zlo_arr = np.where(zlo_arr < med_zlo - 0.55, med_zlo, zlo_arr)
+
+    # Snap bin bottoms/tops cleanly to supporting floor / overhead ceiling when close
+    zlo_arr = np.where(zlo_arr <= z_floor_snap + snap_floor_tol, z_floor_snap + 0.002, zlo_arr)
+    zhi_arr = np.where(zhi_arr >= z_ceil_snap - snap_ceil_tol, z_ceil_snap - 0.002, zhi_arr)
+    zhi_arr = np.minimum(zhi_arr, z_ceil_snap - 0.002)
+    zlo_arr = np.maximum(zlo_arr, z_floor_snap + 0.002)
+
+    valid = (zhi_arr - zlo_arr) >= 0.22
+    if int(np.sum(valid)) < 2:
+        return None, 0.0, 0.0, False
+    bs = np.asarray(bin_s, dtype=np.float64)[valid]
+    zlo_arr = zlo_arr[valid]
+    zhi_arr = zhi_arr[valid]
+
+    z_min_eff = float(np.min(zlo_arr))
+    z_max_eff = float(np.max(zhi_arr))
+    bot_var = float(np.max(zlo_arr) - np.min(zlo_arr))
+    top_var = float(np.max(zhi_arr) - np.min(zhi_arr))
+    is_irregular = (bot_var >= 0.35) or (top_var >= 0.35)
+
+    # Extend outermost valid bins cleanly to [s_lo, s_hi]
+    top_pts: list[tuple[float, float]] = [(s_lo, float(zhi_arr[0]))]
+    for sv, zv in zip(bs, zhi_arr):
+        top_pts.append((float(sv), float(zv)))
+    top_pts.append((s_hi, float(zhi_arr[-1])))
+
+    bot_pts: list[tuple[float, float]] = [(s_hi, float(zlo_arr[-1]))]
+    for sv, zv in zip(bs[::-1], zlo_arr[::-1]):
+        bot_pts.append((float(sv), float(zv)))
+    bot_pts.append((s_lo, float(zlo_arr[0])))
+
+    raw_prof = Polygon(top_pts + bot_pts).buffer(0)
+    if isinstance(raw_prof, MultiPolygon):
+        raw_prof = max(raw_prof.geoms, key=lambda g: g.area)
+    if not isinstance(raw_prof, Polygon) or raw_prof.is_empty or raw_prof.area < 0.15:
+        return None, z_min_eff, z_max_eff, False
+    simp = raw_prof.simplify(0.08, preserve_topology=True).buffer(0)
+    if isinstance(simp, MultiPolygon):
+        simp = max(simp.geoms, key=lambda g: g.area)
+    if not isinstance(simp, Polygon) or simp.is_empty or simp.area < 0.15:
+        simp = raw_prof
+    return orient(simp, sign=1.0), z_min_eff, z_max_eff, is_irregular
+
+
 def build_interior_wall_parts(
     fc: FloorCeilingResult,
     shell: ExteriorShellPlan,
@@ -430,7 +553,7 @@ def build_interior_wall_parts(
     work_labels: np.ndarray,
     cfg: ArchitectureConfig,
 ) -> tuple[list[MeshPart], list[Polygon], list[tuple[Polygon, float, float]], dict[str, Any]]:
-    """Detect and build standalone interior partition walls strictly inside inner_uv (zero exterior overlap)."""
+    """Detect and build standalone interior walls (including overhead headers & sloped under-stairs walls)."""
     uvz = fc.frame.pts_to_uvz(points_local)
     wpts = uvz[work_labels == 2]
     if len(wpts) < cfg.wall_min_points:
@@ -448,7 +571,8 @@ def build_interior_wall_parts(
     if len(int_pts) < cfg.wall_min_points:
         return [], [], [], {"interior_wall_count": 0, "walls": []}
 
-    z_top_limit = fc.ceiling_z if fc.ceiling_z is not None else float(np.percentile(wpts[:, 2], 98))
+    z_primary_ceil = fc.ceiling_z if fc.ceiling_z is not None else float(np.percentile(wpts[:, 2], 98))
+    z_max_ceil = max((float(c.z_bottom) for c in fc.ceiling_levels), default=z_primary_ceil)
     comps = _voxel_connected_components_3d(int_pts, voxel_size=0.12)
     parts: list[MeshPart] = []
     polys_uv: list[Polygon] = []
@@ -468,10 +592,10 @@ def build_interior_wall_parts(
         t_dir = eigvecs[:, 1]
         n_dir = eigvecs[:, 0]
         ang = abs(float(np.degrees(np.arctan2(abs(t_dir[1]), abs(t_dir[0])))))
-        if ang < 10.0:
+        if ang < 7.0:
             t_dir = np.array([1.0, 0.0])
             n_dir = np.array([0.0, 1.0])
-        elif ang > 80.0:
+        elif ang > 83.0:
             t_dir = np.array([0.0, 1.0])
             n_dir = np.array([1.0, 0.0])
 
@@ -481,12 +605,12 @@ def build_interior_wall_parts(
         d_lo, d_hi = float(np.percentile(d_proj, 5)), float(np.percentile(d_proj, 95))
         length = s_hi - s_lo
         meas_thick = d_hi - d_lo
-        z_lo = float(np.percentile(sub[:, 2], 2))
-        z_hi = float(np.percentile(sub[:, 2], 98))
+        z_lo_raw = float(np.percentile(sub[:, 2], 2))
+        z_hi_raw = float(np.percentile(sub[:, 2], 98))
 
-        if length < cfg.wall_min_length_m or (z_hi - z_lo) < cfg.wall_min_height_m:
+        if length < cfg.wall_min_length_m or (z_hi_raw - z_lo_raw) < cfg.wall_min_height_m:
             continue
-        if meas_thick > 0.60:
+        if meas_thick > 0.65:
             continue
 
         thick = float(np.clip(max(meas_thick, cfg.min_wall_thickness_m), cfg.min_wall_thickness_m, cfg.max_wall_thickness_m))
@@ -503,49 +627,101 @@ def build_interior_wall_parts(
         if not isinstance(poly, Polygon) or poly.is_empty or poly.area < 0.03:
             continue
 
-        # Snap bottom to nearest supporting floor level
+        # Determine local floor base & local ceiling top (supports 2F clerestory/step walls above 1F ceiling!)
         base_z = fc.floor_z
         for flv in fc.floor_levels:
-            if not flv.is_primary and flv.polygon_uv.intersects(poly) and abs(z_lo - flv.z_top) <= 0.40:
+            if not flv.is_primary and flv.polygon_uv.intersects(poly) and abs(z_lo_raw - flv.z_top) <= 0.40:
                 base_z = max(base_z, flv.z_top)
-        z0 = base_z + 0.002 if z_lo <= base_z + 0.30 else max(z_lo, base_z + 0.002)
 
-        # Snap top to local overhead slab if close (avoid piercing mezzanine or lower ceiling)
-        local_top = z_top_limit
+        local_top = z_primary_ceil
+        # Check if this wall genuinely sits in/borders a higher ceiling wing (e.g. 2F stairwell step-wall!)
         for clv in fc.ceiling_levels:
-            if not clv.is_primary and clv.z_bottom > z0 + 0.30 and clv.polygon_uv.intersects(poly):
-                local_top = min(local_top, clv.z_bottom)
+            if not clv.is_primary and clv.z_bottom > z_primary_ceil + 0.45:
+                if clv.polygon_uv.buffer(0.60).intersects(poly) and z_hi_raw > z_primary_ceil + 0.30:
+                    local_top = max(local_top, float(clv.z_bottom))
+            elif not clv.is_primary and clv.z_bottom > base_z + 0.30 and clv.polygon_uv.intersects(poly):
+                local_top = min(local_top, float(clv.z_bottom))
         for flv in fc.floor_levels:
-            if not flv.is_primary and flv.z_top - cfg.floor_thickness_m > z0 + 0.30 and flv.polygon_uv.intersects(poly):
+            if not flv.is_primary and flv.z_top - cfg.floor_thickness_m > base_z + 0.30 and flv.polygon_uv.intersects(poly):
                 if float(np.mean(sub[:, 2] > flv.z_top + 0.25)) < 0.08:
                     local_top = min(local_top, flv.z_top - cfg.floor_thickness_m)
 
-        z1 = local_top - 0.002 if z_hi >= local_top - 0.35 else min(z_hi, local_top - 0.002)
-        if z1 <= z0 + 0.30:
+        # Build true 2D (s, z) profile so overhead headers & sloped under-stairs walls NEVER drop fake curtains to the floor!
+        poly_coords = np.asarray(poly.exterior.coords, dtype=np.float64)[:, :2]
+        rel_poly = poly_coords - mean_uv[None, :]
+        s_clip_lo = float(np.min(rel_poly @ t_dir))
+        s_clip_hi = float(np.max(rel_poly @ t_dir))
+        prof_sz, z0, z1, is_irreg = _build_stepped_wall_profile_sz(
+            s_proj,
+            sub[:, 2],
+            max(s_lo, s_clip_lo),
+            min(s_hi, s_clip_hi),
+            base_z,
+            local_top,
+        )
+        if prof_sz is None or z1 <= z0 + 0.25:
             continue
+
+        # Also avoid colliding with primary ceiling slab when a 2F clerestory wall starts just below/inside ceiling_primary
+        if fc.ceiling_z is not None and z0 >= fc.ceiling_z - 0.12 and z1 > fc.ceiling_z + cfg.ceiling_thickness_m + 0.15:
+            # Start cleanly flush at fc.ceiling_z + 0.002 and register in slab_cutouts so ceiling_primary trims cleanly around it!
+            z0_snap = max(z0, fc.ceiling_z + 0.002)
+            prof_sz = prof_sz.intersection(Polygon([
+                (s_clip_lo - 1.0, z0_snap),
+                (s_clip_hi + 1.0, z0_snap),
+                (s_clip_hi + 1.0, local_top - 0.002),
+                (s_clip_lo - 1.0, local_top - 0.002),
+            ])).buffer(0)
+            if isinstance(prof_sz, MultiPolygon):
+                prof_sz = max(prof_sz.geoms, key=lambda g: g.area)
+            if not isinstance(prof_sz, Polygon) or prof_sz.is_empty or prof_sz.area < 0.15:
+                continue
+            z0 = z0_snap
 
         poly_clean = orient(poly.buffer(0), sign=1.0)
         if isinstance(poly_clean, MultiPolygon):
             poly_clean = max(poly_clean.geoms, key=lambda g: g.area)
-        v_uv, tri = extrude_polygon_solid(poly_clean, z0, z1)
+
+        if is_irreg:
+            try:
+                v_xyz, tri = _extrude_wall_sz_profile(
+                    fc,
+                    mean_uv,
+                    t_dir,
+                    n_dir,
+                    d_mid - 0.5 * thick,
+                    d_mid + 0.5 * thick,
+                    prof_sz,
+                )
+            except ValueError:
+                continue
+        else:
+            v_uv, tri = extrude_polygon_solid(poly_clean, z0, z1)
+            v_xyz = fc.frame.uvz_to_xyz(v_uv)
+
         pid = f"int_wall_{len(parts):02d}"
+        role = "interior_wall_header" if z0 > base_z + 0.55 else ("interior_wall_irregular" if is_irreg else "interior_wall")
         parts.append(
             MeshPart(
                 part_id=pid,
                 class_id=2,
-                role="interior_wall",
-                vertices=fc.frame.uvz_to_xyz(v_uv),
+                role=role,
+                vertices=v_xyz,
                 triangles=tri,
                 evidence_kind="measured",
                 metadata={
                     "length_m": round(length, 3),
                     "thickness_m": round(thick, 4),
                     "z_span": [round(z0, 4), round(z1, 4)],
+                    "irregular_profile": bool(is_irreg),
                     "point_count": int(len(comp)),
                 },
             )
         )
-        polys_uv.append(poly_clean)
+        # Only floor-standing interior walls act as full-height 2D XY blockers;
+        # overhead header / 2F clerestory walls only block objects overlapping their [z0, z1] band!
+        if z0 <= fc.floor_z + 0.55:
+            polys_uv.append(poly_clean)
         slab_cutouts.append((poly_clean, z0, z1))
         placed_union = poly_clean if placed_union is None else unary_union([placed_union, poly_clean])
         logs.append(parts[-1].metadata | {"part_id": pid})

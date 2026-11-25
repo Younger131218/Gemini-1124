@@ -688,12 +688,35 @@ def analyze_floor_and_ceiling(
             iv = np.clip(np.floor((pts_add[:, 1] - v0) / cell).astype(np.int64), 0, nv - 1)
             grid[iu, iv] = True
 
+    # Recover enclosed interior corners where floor scan was occluded (e.g. under stairs/mid-landings)
+    # using perimeter wall (class 2) enclosure:
+    #   filled_interior = binary_fill_holes(grid | wall_grid) & (~wall_grid)
+    # Open outdoor wall fins enclose zero hole, so they are NEVER included!
+    max_ceil_z = max((c.z_bottom for c in ceiling_levels), default=(ceiling_z if ceiling_z is not None else floor_z + 4.0))
+    wall_uvz = uvz[work_labels == 2]
+    wall_in_z = wall_uvz[(wall_uvz[:, 2] >= floor_z - 0.30) & (wall_uvz[:, 2] <= max_ceil_z + 0.45)]
+    if len(wall_in_z) >= 200:
+        w_counts = np.zeros((nu, nv), dtype=np.int32)
+        wi_u = np.clip(np.floor((wall_in_z[:, 0] - u0) / cell).astype(np.int64), 0, nu - 1)
+        wi_v = np.clip(np.floor((wall_in_z[:, 1] - v0) / cell).astype(np.int64), 0, nv - 1)
+        np.add.at(w_counts, (wi_u, wi_v), 1)
+        wall_grid = w_counts >= 12
+        wall_grid_closed = ndimage.binary_closing(wall_grid, structure=np.ones((3, 3), dtype=bool), iterations=2)
+        filled_with_walls = ndimage.binary_fill_holes(grid | wall_grid_closed)
+        enclosed_voids = filled_with_walls & (~wall_grid_closed) & (~grid)
+        if np.any(enclosed_voids):
+            # Only keep enclosed interior voids directly connected to the main room footprint
+            lbl_all, _ = ndimage.label(grid | enclosed_voids)
+            main_labels = set(int(x) for x in np.unique(lbl_all[grid]) if x > 0)
+            if main_labels:
+                keep_void = np.isin(lbl_all, list(main_labels)) & enclosed_voids
+                grid = grid | keep_void
+
     struct = np.ones((5, 5), dtype=bool)
     closed = ndimage.binary_closing(grid, structure=struct, iterations=2)
     raw_poly = _raster_mask_to_polygon(closed, u0, v0, cell)
     ortho_poly = _snap_orthogonal_polygon(raw_poly)
 
-    wall_uvz = uvz[work_labels == 2]
     snapped_poly, edge_logs = _refine_footprint_edges_to_walls(ortho_poly, wall_uvz)
     snapped_poly, squared_bevels = _square_spurious_corner_bevels(snapped_poly, wall_uvz)
     if squared_bevels > 0:

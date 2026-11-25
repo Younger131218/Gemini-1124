@@ -110,7 +110,7 @@ def run_pipeline(
         cloud.points_local,
         wl_state.work_labels,
         pcfg.architecture,
-        extra_blocker_bands=stair_beam_blockers,
+        extra_blocker_bands=[*stair_beam_blockers, *int_wall_cutouts],
     )
 
     raised_wall_cutouts = collect_raised_exterior_wall_cutouts(fc, shell)
