@@ -307,6 +307,8 @@ class FurnitureLibrary:
         base_sl = vz[vz[:, 2] <= 0.30 * h]
         seat_sl = vz[(vz[:, 2] >= 0.35 * h) & (vz[:, 2] <= 0.55 * h)]
         back_sl = vz[vz[:, 2] >= 0.68 * h]
+        back_hi = vz[vz[:, 2] >= 0.72 * h]
+        back_y_ref = back_hi if len(back_hi) >= 12 else back_sl
 
         base_w = float(base_sl[:, 0].max() - base_sl[:, 0].min()) if len(base_sl) else float(ext[0])
         seat_w = float(seat_sl[:, 0].max() - seat_sl[:, 0].min()) if len(seat_sl) else float(ext[0])
@@ -314,7 +316,8 @@ class FurnitureLibrary:
         seat_yc = float(seat_sl[:, 1].mean()) if len(seat_sl) else 0.0
         seat_zc = float(seat_sl[:, 2].mean()) if len(seat_sl) else 0.45 * h
         back_w = float(back_sl[:, 0].max() - back_sl[:, 0].min()) if len(back_sl) else float(ext[0])
-        back_yc = float(back_sl[:, 1].mean()) if len(back_sl) else -0.34 * float(ext[1])
+        # Match the exact >= 0.72*h upper backrest band (above armrests) used on the point cloud!
+        back_yc = float(np.median(back_y_ref[:, 1])) if len(back_y_ref) else -0.34 * float(ext[1])
 
         rec = {
             "asset_id": asset_id,

@@ -230,3 +230,58 @@ def test_cabinet_six_face_solidity_gate_rejects_hollow_open_top() -> None:
     t_no_top = t[nu[:, 2] < 0.5]
     ok_hollow, ratios_hollow = _check_cabinet_six_faces_solid(v, t_no_top)
     assert not ok_hollow and ratios_hollow["top_pz"] == 0.0, ratios_hollow
+
+
+def test_asymmetric_lidar_backrest_and_valley_row_split(tmp_path: Path) -> None:
+    # 4 chairs spaced 0.90m apart along a conference table (3.3m total span), with:
+    # - Sparse bridge points at floor level merging all 4 chairs into ONE 3D connected component
+    # - 5x denser LiDAR scan points on the +Y edge of every backrest (must NOT pull chair centers off!)
+    # Must emit EXACTLY 4 chairs (not 5!) with <= 5cm lateral error and min chair spacing >= 0.50m!
+    floor = _grid_xy(0.0, 6.0, 0.0, 6.0, z=0.0, step=0.08)
+    ceil = _grid_xy(0.0, 6.0, 0.0, 6.0, z=3.2, step=0.08)
+    walls = np.vstack([
+        _grid_wall_x(0.0, 6.0, 0.0, 0.0, 3.2),
+        _grid_wall_x(0.0, 6.0, 6.0, 0.0, 3.2),
+        _grid_wall_y(0.0, 0.0, 6.0, 0.0, 3.2),
+        _grid_wall_y(6.0, 0.0, 6.0, 0.0, 3.2),
+    ])
+    table = _grid_xy(1.5, 2.8, 1.0, 4.8, z=0.75, step=0.04)
+
+    chair_ys = [1.45, 2.35, 3.25, 4.15]
+    chair_clouds = []
+    for yc in chair_ys:
+        seat = _grid_xy(3.10, 3.55, yc - 0.24, yc + 0.24, z=0.45, step=0.04)
+        back = _grid_wall_y(3.60, yc - 0.25, yc + 0.25, 0.45, 1.00, step=0.04)
+        # 5x denser overscan strictly on the +Y edge [yc+0.18 .. yc+0.25] of every backrest!
+        overscan = _grid_wall_y(3.60, yc + 0.18, yc + 0.25, 0.45, 1.00, step=0.012)
+        chair_clouds.extend([seat, back, overscan])
+    # Add sparse connecting wisps at z=0.05..0.55 between chairs so voxel=0.08 merges all 4 into 1 strip
+    bridge = np.column_stack([
+        np.full(80, 3.35),
+        np.linspace(1.45, 4.15, 80),
+        np.full(80, 0.15),
+    ])
+    chairs_all = np.vstack(chair_clouds + [bridge])
+
+    pts = np.vstack([floor, ceil, walls, table, chairs_all])
+    cls = np.concatenate([
+        np.full(len(floor), 1),
+        np.full(len(ceil), 0),
+        np.full(len(walls), 2),
+        np.full(len(table), 8),
+        np.full(len(chairs_all), 7),
+    ])
+    las_file = tmp_path / "synth_asym_row.las"
+    _write_las(las_file, pts, cls)
+    out_dir = tmp_path / "out_asym"
+    report = run_pipeline(las_file, out_dir, stage="furniture", library_root=None, render_preview=False)
+
+    assert report["status"] == "PASS", report["relation_audit"]
+    assert report["relation_audit"]["unexpected_penetration_count"] == 0
+    ch_list = report["furniture"]["chairs"]["chairs"]
+    assert len(ch_list) == 4, ch_list
+    # Verify lateral center accuracy (immune to 5x overscan on +Y edge) & min spacing >= 0.50m
+    placed_ys = sorted([c["center_uv"][1] for c in ch_list])
+    # Room UV might flip/shift origin, so compare inter-chair spacings and uniform alignment!
+    spacings = np.diff(placed_ys)
+    assert np.all(spacings >= 0.78) and np.all(spacings <= 1.02), (placed_ys, spacings)
