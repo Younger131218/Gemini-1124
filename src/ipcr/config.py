@@ -85,7 +85,7 @@ class FurnitureConfig:
     sofa_min_width_m: float = 0.70
     sofa_min_height_m: float = 0.50
     chair_min_points: int = 250
-    chair_min_height_m: float = 0.45
+    chair_min_height_m: float = 0.38
     chair_max_height_m: float = 1.35
     chair_row_slot_m: float = 0.68
     clearance_m: float = 0.010

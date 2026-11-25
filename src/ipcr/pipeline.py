@@ -130,7 +130,8 @@ def run_pipeline(
         z_blockers = [*stair_beam_blockers]
 
         table_parts, table_specs, table_audit = build_table_parts(
-            fc, shell, static_blockers, z_blockers, cloud.points_local, wl_state.work_labels, pcfg.furniture
+            fc, shell, static_blockers, z_blockers, cloud.points_local, wl_state.work_labels, pcfg.furniture,
+            library=library,
         )
         parts.extend(table_parts)
 

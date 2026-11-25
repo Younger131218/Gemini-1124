@@ -1,4 +1,4 @@
-"""Stage 2 B10/B15 structural & library-matched reconstruction for tables (8), cabinets (9), and sofas (10)."""
+"""Stage 2 B10/B15 structural & multi-asset library reconstruction for tables (8), cabinets (9), and sofas (10)."""
 
 from __future__ import annotations
 
@@ -42,10 +42,25 @@ def _local_floor_z(fc: FloorCeilingResult, u: float, v: float, z_lo_meas: float)
     return best
 
 
-def _extract_contour_uv(pts_uv: np.ndarray, *, cell: float = 0.05) -> Polygon | None:
-    """Extract clean hole-free functional 2D contour from top-surface points (preserves L/U shapes per B15!)."""
-    if len(pts_uv) < 30:
-        return None
+def _dominant_tabletop_z(sub_z: np.ndarray) -> float:
+    """Find the dominant horizontal tabletop plane Z peak (rejecting tall monitor/chair-back bleed!)."""
+    z_lo = float(np.percentile(sub_z, 55))
+    z_hi = float(np.percentile(sub_z, 99))
+    upper = sub_z[(sub_z >= z_lo) & (sub_z <= z_hi)]
+    if len(upper) < 30 or (z_hi - z_lo) < 0.04:
+        return float(np.percentile(sub_z, 92))
+    bins = np.arange(z_lo - 0.01, z_hi + 0.03, 0.02)
+    hist, edges = np.histogram(upper, bins=bins)
+    pk = int(np.argmax(hist))
+    zc = 0.5 * (edges[pk] + edges[pk + 1])
+    band = upper[np.abs(upper - zc) <= 0.035]
+    return float(np.median(band)) if len(band) >= 15 else zc
+
+
+def _extract_denoised_tabletop_contour(pts_uv: np.ndarray, *, cell: float = 0.05) -> tuple[Polygon | None, np.ndarray]:
+    """Density-denoised 2D tabletop contour: strips edge noise wisps while faithfully preserving L/U/curved desks (B15)."""
+    if len(pts_uv) < 40:
+        return None, pts_uv
     pad = 0.25
     u0, v0 = float(pts_uv[:, 0].min()) - pad, float(pts_uv[:, 1].min()) - pad
     u1, v1 = float(pts_uv[:, 0].max()) + pad, float(pts_uv[:, 1].max()) + pad
@@ -55,18 +70,49 @@ def _extract_contour_uv(pts_uv: np.ndarray, *, cell: float = 0.05) -> Polygon | 
         cell = 0.08
         nu = int(np.ceil((u1 - u0) / cell)) + 2
         nv = int(np.ceil((v1 - v0) / cell)) + 2
-    grid = np.zeros((nu, nv), dtype=bool)
+
     iu = np.clip(np.floor((pts_uv[:, 0] - u0) / cell).astype(np.int64), 0, nu - 1)
     iv = np.clip(np.floor((pts_uv[:, 1] - v0) / cell).astype(np.int64), 0, nv - 1)
-    grid[iu, iv] = True
-    closed = ndimage.binary_closing(grid, structure=np.ones((3, 3), dtype=bool), iterations=2)
+    counts = np.zeros((nu, nv), dtype=np.int32)
+    np.add.at(counts, (iu, iv), 1)
+    nz = counts[counts > 0]
+    if len(nz) == 0:
+        return None, pts_uv
+
+    # Strip sparse stray noise wisps around tabletop edges (< 12% of median tabletop cell density)
+    min_cell = max(2, int(float(np.median(nz)) * 0.12))
+    mask = counts >= min_cell
+    # Morphological opening (2x2 or 3x3 cross) shears 1-cell wisps while preserving thin desk wings
+    cross = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+    opened = ndimage.binary_opening(mask, structure=cross, iterations=1)
+    if np.any(opened):
+        mask = opened
+    closed = ndimage.binary_closing(mask, structure=np.ones((3, 3), dtype=bool), iterations=2)
+
+    # Keep the dominant connected tabletop component so disconnected scatter fragments are dropped!
+    filled = ndimage.binary_fill_holes(closed)
+    labeled, ncomp = ndimage.label(filled)
+    if ncomp == 0:
+        return None, pts_uv
+    comp_pts = [int(counts[labeled == cid].sum()) for cid in range(1, ncomp + 1)]
+    best_cid = 1 + int(np.argmax(comp_pts))
+    clean_mask = labeled == best_cid
+    core_uv = pts_uv[clean_mask[iu, iv]]
+    if len(core_uv) < 30:
+        core_uv = pts_uv
+
     try:
-        raw = _raster_mask_to_polygon(closed, u0, v0, cell)
+        raw = _raster_mask_to_polygon(clean_mask, u0, v0, cell)
     except ValueError:
-        return None
-    if raw.is_empty or raw.area < 0.05:
-        return None
-    return _snap_orthogonal_polygon(raw, simplify_tol=0.06, min_edge_len=0.15)
+        return None, core_uv
+    if raw.is_empty or raw.area < 0.08:
+        return None, core_uv
+
+    # Smooth softly: keep curved arcs smooth (tol=0.05) while snapping only near-axis straight edges (<=12 deg)
+    simp = raw.simplify(0.05, preserve_topology=True).buffer(0)
+    if isinstance(simp, MultiPolygon):
+        simp = max(simp.geoms, key=lambda g: g.area)
+    return orient(Polygon(simp.exterior.coords), sign=1.0), core_uv
 
 
 def _extract_dense_core_uv(pts_uv: np.ndarray, *, cell: float = 0.08) -> np.ndarray:
@@ -86,13 +132,11 @@ def _extract_dense_core_uv(pts_uv: np.ndarray, *, cell: float = 0.08) -> np.ndar
     nz = counts[counts > 0]
     if len(nz) == 0:
         return pts_uv
-    # Scale-invariant density threshold: strips sparse rear wall-bleed bridges (<< 12% of median cell density)
     min_cell = max(4, int(float(np.median(nz)) * 0.12))
     mask = counts >= min_cell
     labeled, ncomp = ndimage.label(mask, structure=np.ones((3, 3), dtype=bool))
     if ncomp <= 1:
         return pts_uv
-    # Keep the highest-point-count connected 2D component (strips disconnected rear wall-bleed!)
     comp_pts = [int(counts[labeled == cid].sum()) for cid in range(1, ncomp + 1)]
     best_cid = 1 + int(np.argmax(comp_pts))
     keep_mask = labeled[iu, iv] == best_cid
@@ -110,7 +154,6 @@ def _fit_obb_2d(pts_uv: np.ndarray, snap_deg: float = 12.0) -> tuple[np.ndarray,
     long_dir = eigvecs[:, 1].copy()
     long_dir /= max(float(np.linalg.norm(long_dir)), 1e-9)
 
-    # Snap to room U/V axis ONLY if already within snap_deg (preserves genuinely angled cabinets!)
     cos_s = float(np.cos(np.radians(snap_deg)))
     for ax in (np.array([1.0, 0.0]), np.array([-1.0, 0.0]), np.array([0.0, 1.0]), np.array([0.0, -1.0])):
         if float(np.dot(long_dir, ax)) >= cos_s:
@@ -126,6 +169,41 @@ def _fit_obb_2d(pts_uv: np.ndarray, snap_deg: float = 12.0) -> tuple[np.ndarray,
     return center, long_dir, depth_dir, l1 - l0, d1 - d0
 
 
+def _obb_poly(center: np.ndarray, long_dir: np.ndarray, depth_dir: np.ndarray, length: float, depth: float) -> Polygon:
+    hl, hd = 0.5 * length, 0.5 * depth
+    corners = [
+        center - long_dir * hl - depth_dir * hd,
+        center + long_dir * hl - depth_dir * hd,
+        center + long_dir * hl + depth_dir * hd,
+        center - long_dir * hl + depth_dir * hd,
+    ]
+    return orient(Polygon(corners), sign=1.0)
+
+
+def _has_real_concave_cutout(contour: Polygon, obb: Polygon, long_dir: np.ndarray, depth_dir: np.ndarray) -> bool:
+    """Distinguish true L/U/curved desks (recessed cutout >= 0.38m in BOTH dimensions) from tiny rectangular edge noise!"""
+    fill_ratio = float(contour.area / max(obb.area, 1e-6))
+    if fill_ratio >= 0.83:
+        return False
+    missing = obb.difference(contour).buffer(0)
+    geoms = (
+        list(missing.geoms)
+        if isinstance(missing, MultiPolygon)
+        else ([missing] if isinstance(missing, Polygon) else [])
+    )
+    for g in geoms:
+        if g.is_empty or g.area < 0.16:
+            continue
+        pts = np.asarray(list(g.exterior.coords)[:-1], dtype=np.float64)
+        sl = pts @ long_dir
+        sd = pts @ depth_dir
+        cut_l = float(sl.max() - sl.min())
+        cut_d = float(sd.max() - sd.min())
+        if min(cut_l, cut_d) >= 0.38:
+            return True
+    return False
+
+
 def build_table_parts(
     fc: FloorCeilingResult,
     shell: ExteriorShellPlan,
@@ -134,13 +212,16 @@ def build_table_parts(
     points_local: np.ndarray,
     work_labels: np.ndarray,
     cfg: FurnitureConfig,
+    *,
+    library: FurnitureLibrary | None = None,
 ) -> tuple[list[MeshPart], list[TableSpec], dict[str, Any]]:
-    """Build B15 open-frame structural tables (exact functional tabletop contour + open under-desk legs)."""
+    """Build B10/B15 tables: denoised true-shape gate (library folding_table for compatible rects + exact L/curved contour)."""
     uvz = fc.frame.pts_to_uvz(points_local)
     tpts = uvz[work_labels == 8]
     if len(tpts) < cfg.table_min_points:
         return [], [], {"emitted_tables": 0, "emitted_parts": 0, "tables": [], "rejected": []}
 
+    table_asset = library.get_best_asset(8) if library is not None else None
     allowed_base = shell.inner_uv.buffer(-cfg.clearance_m)
     if static_blockers_uv:
         allowed_base = allowed_base.difference(unary_union([p.buffer(cfg.clearance_m) for p in static_blockers_uv])).buffer(0)
@@ -159,7 +240,7 @@ def build_table_parts(
         u_mid, v_mid = float(np.median(sub[:, 0])), float(np.median(sub[:, 1]))
         z_lo_raw = float(np.percentile(sub[:, 2], 3))
         z_floor = _local_floor_z(fc, u_mid, v_mid, z_lo_raw)
-        z_top = float(np.percentile(sub[:, 2], 94))
+        z_top = _dominant_tabletop_z(sub[:, 2])
         h = z_top - z_floor
 
         if h < cfg.table_min_height_m or h > cfg.table_max_height_m:
@@ -171,22 +252,27 @@ def build_table_parts(
             })
             continue
 
-        top_slice = sub[sub[:, 2] >= z_top - 0.14]
+        # Tight tabletop horizontal plane slice (+-4.5cm) rejects chair-back & under-desk bleed!
+        top_slice = sub[np.abs(sub[:, 2] - z_top) <= 0.048]
         if len(top_slice) < 80:
+            top_slice = sub[sub[:, 2] >= z_top - 0.10]
+        if len(top_slice) < 50:
             top_slice = sub
-        contour = _extract_contour_uv(top_slice[:, :2], cell=0.05)
+
+        contour, core_uv = _extract_denoised_tabletop_contour(top_slice[:, :2], cell=0.05)
         if contour is None:
             continue
 
-        u0, v0, u1, v1 = contour.bounds
-        aabb_poly = box(u0, v0, u1, v1)
-        fill_ratio = float(contour.area / max(aabb_poly.area, 1e-6))
-        is_rect = fill_ratio >= 0.80
+        center_uv, long_dir, depth_dir, length, depth = _fit_obb_2d(core_uv, snap_deg=12.0)
+        obb_rect = _obb_poly(center_uv, long_dir, depth_dir, length, depth)
+
+        # True L/U/curved desk vs rectangular desk with tiny noise wisps!
+        is_irregular = _has_real_concave_cutout(contour, obb_rect, long_dir, depth_dir)
+        is_rect = not is_irregular
         if is_rect:
-            ru0, ru1 = float(np.percentile(top_slice[:, 0], 2)), float(np.percentile(top_slice[:, 0], 98))
-            rv0, rv1 = float(np.percentile(top_slice[:, 1], 2)), float(np.percentile(top_slice[:, 1], 98))
-            poly_uv = box(ru0, rv0, ru1, rv1)
+            poly_uv = obb_rect
         else:
+            # Keep exact denoised L/U/curved contour (if straight L-desk, gently orthogonalize; preserve smooth arcs!)
             poly_uv = contour
 
         cur_allowed = allowed_base
@@ -210,27 +296,86 @@ def build_table_parts(
         poly_clean = orient(clipped.buffer(0), sign=1.0)
         if isinstance(poly_clean, MultiPolygon):
             poly_clean = max(poly_clean.geoms, key=lambda g: g.area)
-        minx, miny, maxx, maxy = poly_clean.bounds
-        du, dv = maxx - minx, maxy - miny
-        if min(du, dv) < 0.28:
+        if min(length, depth) < 0.28:
             rejected.append({
                 "cluster_idx": ci,
                 "point_count": int(len(comp)),
-                "extent_uv_m": [round(du, 3), round(dv, 3)],
+                "obb_ld_m": [round(length, 3), round(depth, 3)],
                 "reason": "too_narrow_for_table",
             })
             continue
 
+        tid = f"table_{len(specs):02d}"
         top_bot = max(z_floor + 0.15, z_top - cfg.table_top_thickness_m)
-        if z_top - top_bot < 0.02:
+
+        # Case A: Rectangular table within library folding_table proportions -> use verified watertight folding_table.glb!
+        aspect = length / max(depth, 1e-6)
+        use_lib_table = (
+            is_rect
+            and table_asset is not None
+            and 1.05 <= length <= 2.75
+            and 0.40 <= depth <= 1.15
+            and 1.45 <= aspect <= 4.30
+            and cur_allowed.buffer(0.002).contains(obb_rect)
+        )
+        if use_lib_table and table_asset is not None:
+            # Canonical folding_table has long axis along X (width), depth along Y -> front_dir = depth_dir, right_dir = long_dir
+            front_for_table = np.array([-long_dir[1], long_dir[0]], dtype=np.float64)
+            sx = length / float(table_asset.extents_xyz[0])
+            sy = depth / float(table_asset.extents_xyz[1])
+            sz = h / float(table_asset.extents_xyz[2])
+            tv_uv, tt = table_asset.transform_to_uvz(center_uv, z_floor + 0.002, front_for_table, sx, sy, sz)
+            parts.append(
+                MeshPart(
+                    part_id=tid,
+                    class_id=8,
+                    role="table_library",
+                    vertices=fc.frame.uvz_to_xyz(tv_uv),
+                    triangles=tt,
+                    evidence_kind="library_matched",
+                    metadata={
+                        "table_id": tid,
+                        "asset_id": table_asset.asset_id,
+                        "asset_sha256": table_asset.sha256,
+                        "shape": "rectangular_library",
+                        "obb_ldh_m": [round(length, 3), round(depth, 3), round(h, 3)],
+                        "point_count": int(len(comp)),
+                    },
+                )
+            )
+            specs.append(
+                TableSpec(
+                    table_id=tid,
+                    poly_uv=obb_rect,
+                    z_floor=z_floor,
+                    z_top=z_top,
+                    tabletop_z_bot=top_bot,
+                    leg_polys_uv=[],
+                    is_rectangular=True,
+                )
+            )
+            placed_union = obb_rect if placed_union is None else unary_union([placed_union, obb_rect])
+            logs.append({
+                "table_id": tid,
+                "library_matched": True,
+                "asset_id": table_asset.asset_id,
+                "shape": "rectangular_library",
+                "obb_ldh_m": [round(length, 3), round(depth, 3), round(h, 3)],
+                "area_m2": round(float(obb_rect.area), 3),
+                "z_span": [round(z_floor, 4), round(z_top, 4)],
+                "point_count": int(len(comp)),
+            })
             continue
 
+        # Case B/C: Giant conference table OR true L-shaped / U-shaped / curved desk -> B15 open-frame structural table!
+        if z_top - top_bot < 0.02:
+            continue
         try:
             tv_uv, tt = extrude_polygon_solid(poly_clean, top_bot, z_top)
         except ValueError:
             continue
 
-        tid = f"table_{len(specs):02d}"
+        shape_kind = "rectangular_conference" if is_rect else "irregular_shaped_contour"
         parts.append(
             MeshPart(
                 part_id=f"{tid}_top",
@@ -241,12 +386,12 @@ def build_table_parts(
                 evidence_kind="parametric_rule_fallback",
                 metadata={
                     "table_id": tid,
-                    "shape": "rectangular" if is_rect else "shaped_contour",
+                    "shape": shape_kind,
                     "area_m2": round(float(poly_clean.area), 3),
-                    "extent_uv_m": [round(du, 3), round(dv, 3)],
-                    "z_top_above_floor_m": round(z_top - z_floor, 3),
+                    "obb_ldh_m": [round(length, 3), round(depth, 3), round(h, 3)],
+                    "z_top_above_floor_m": round(h, 3),
                     "point_count": int(len(comp)),
-                    "library_fallback_reason": "b15_exact_contour_and_open_under_desk_space",
+                    "library_fallback_reason": "irregular_or_oversized_conference_table_b10_b15",
                 },
             )
         )
@@ -258,27 +403,23 @@ def build_table_parts(
 
         if leg_z1 - leg_z0 >= 0.25:
             leg_centers: list[tuple[float, float]] = []
-            if is_rect and len(list(poly_clean.exterior.coords)) <= 6:
-                long_u = du >= dv
-                in_u = min(0.18 if (not long_u and du >= 1.1) else 0.09, du * 0.25)
-                in_v = min(0.18 if (long_u and dv >= 1.1) else 0.09, dv * 0.25)
-                u_len = du - 2 * in_u
-                v_len = dv - 2 * in_v
-                nu_legs = max(2, int(np.ceil(u_len / 2.2)) + 1) if long_u else 2
-                nv_legs = max(2, int(np.ceil(v_len / 2.2)) + 1) if not long_u else 2
-                us = np.linspace(minx + in_u, maxx - in_u, nu_legs)
-                vs = np.linspace(miny + in_v, maxy - in_v, nv_legs)
-                for lu in us:
-                    for lv in vs:
-                        leg_centers.append((float(lu), float(lv)))
+            if is_rect:
+                in_l = min(0.14, length * 0.20)
+                in_d = min(0.18 if depth >= 1.1 else 0.09, depth * 0.25)
+                nl = max(2, int(np.ceil((length - 2 * in_l) / 2.2)) + 1)
+                for sl_pos in np.linspace(-0.5 * length + in_l, 0.5 * length - in_l, nl):
+                    for sd_pos in (-0.5 * depth + in_d, 0.5 * depth - in_d):
+                        p_uv = center_uv + long_dir * sl_pos + depth_dir * sd_pos
+                        leg_centers.append((float(p_uv[0]), float(p_uv[1])))
             else:
                 inset = poly_clean.buffer(-0.10, join_style=2)
                 if isinstance(inset, MultiPolygon):
                     inset = max(inset.geoms, key=lambda g: g.area)
                 if isinstance(inset, Polygon) and not inset.is_empty:
-                    for cx, cy in list(inset.exterior.coords)[:-1]:
-                        if all(np.hypot(cx - ox, cy - oy) >= 0.35 for ox, oy in leg_centers):
-                            leg_centers.append((float(cx), float(cy)))
+                    # Sample corners / perimeter vertices every >=0.45m for stable support under L/curved wings
+                    for cx_v, cy_v in list(inset.exterior.coords)[:-1]:
+                        if all(np.hypot(cx_v - ox, cy_v - oy) >= 0.45 for ox, oy in leg_centers):
+                            leg_centers.append((float(cx_v), float(cy_v)))
 
             for lidx, (lu, lv) in enumerate(leg_centers):
                 lbox = box(lu - 0.5 * leg_sz, lv - 0.5 * leg_sz, lu + 0.5 * leg_sz, lv + 0.5 * leg_sz)
@@ -317,8 +458,9 @@ def build_table_parts(
         placed_union = poly_clean if placed_union is None else unary_union([placed_union, poly_clean])
         logs.append({
             "table_id": tid,
-            "shape": "rectangular" if is_rect else "shaped_contour",
-            "extent_uv_m": [round(du, 3), round(dv, 3)],
+            "library_matched": False,
+            "shape": shape_kind,
+            "obb_ldh_m": [round(length, 3), round(depth, 3), round(h, 3)],
             "area_m2": round(float(poly_clean.area), 3),
             "z_span": [round(z_floor, 4), round(z_top, 4)],
             "leg_count": len(leg_polys),
@@ -328,20 +470,10 @@ def build_table_parts(
     return parts, specs, {
         "emitted_tables": len(specs),
         "emitted_parts": len(parts),
+        "library_matched_tables": sum(1 for x in logs if x.get("library_matched")),
         "tables": logs,
         "rejected": rejected,
     }
-
-
-def _obb_poly(center: np.ndarray, long_dir: np.ndarray, depth_dir: np.ndarray, length: float, depth: float) -> Polygon:
-    hl, hd = 0.5 * length, 0.5 * depth
-    corners = [
-        center - long_dir * hl - depth_dir * hd,
-        center + long_dir * hl - depth_dir * hd,
-        center + long_dir * hl + depth_dir * hd,
-        center - long_dir * hl + depth_dir * hd,
-    ]
-    return orient(Polygon(corners), sign=1.0)
 
 
 def build_cabinet_parts(
@@ -356,13 +488,12 @@ def build_cabinet_parts(
     *,
     library: FurnitureLibrary | None = None,
 ) -> tuple[list[MeshPart], list[tuple[Polygon, float, float]], dict[str, Any]]:
-    """Build B10/B15 cabinets: dense-core OBB depth, front-facing direction, and tiled library armored_cabinet2.glb."""
+    """Build B10/B15 cabinets with dense-core OBB depth and multi-asset selection (armored_cabinet2 / metal_filing_cabinet)."""
     uvz = fc.frame.pts_to_uvz(points_local)
     cpts = uvz[work_labels == 9]
     if len(cpts) < cfg.cabinet_min_points:
         return [], [], {"emitted_cabinets": 0, "emitted_parts": 0, "cabinets": [], "rejected": []}
 
-    cab_asset = library.get_best_asset(9) if library is not None else None
     allowed_base = shell.inner_uv.buffer(-cfg.clearance_m)
     if static_blockers_uv:
         allowed_base = allowed_base.difference(unary_union([p.buffer(cfg.clearance_m) for p in static_blockers_uv])).buffer(0)
@@ -379,7 +510,6 @@ def build_cabinet_parts(
         if len(comp) < cfg.cabinet_min_points:
             continue
         sub = cpts[comp]
-        # Strip disconnected rear wall-bleed slivers before measuring cabinet OBB depth!
         core_uv = _extract_dense_core_uv(sub[:, :2], cell=0.08)
         center_uv, long_dir, depth_dir, length, depth = _fit_obb_2d(core_uv, snap_deg=12.0)
 
@@ -464,8 +594,6 @@ def build_cabinet_parts(
             rejected.append({"cluster_idx": ci, "point_count": int(len(comp)), "reason": "eliminated_by_clearance"})
             continue
 
-        # Determine cabinet front-facing direction (+depth_dir vs -depth_dir):
-        # Front face has higher scanned point density AND faces away from nearest exterior wall!
         sd_core = (core_uv - center_uv[None, :]) @ depth_dir
         pos_cnt = int(np.sum(sd_core > 0.15 * depth))
         neg_cnt = int(np.sum(sd_core < -0.15 * depth))
@@ -475,14 +603,16 @@ def build_cabinet_parts(
             front_dir = depth_dir if pos_cnt >= neg_cnt else -depth_dir
         else:
             front_dir = depth_dir if float(np.dot(away_wall, depth_dir)) >= 0 else -depth_dir
-
-        # Right-handed lateral axis (+X_local = right = (fy_y, -fy_x))
         right_dir = np.array([front_dir[1], -front_dir[0]], dtype=np.float64)
 
-        # Use verified watertight library cabinet (armored_cabinet2.glb) for freestanding/wall-side cabinets (height>=0.80m)!
+        # Rank all verified cabinet assets (armored_cabinet2 vs metal_filing_cabinet) by measured (depth, height)!
+        ranked_cabs = (
+            library.rank_assets(9, (min(length, 1.1), depth, height)) if library is not None else []
+        )
+        cab_asset = ranked_cabs[0] if ranked_cabs else None
+
         used_library = False
         if cab_asset is not None and not is_under_table and height >= 0.80 and depth >= 0.18:
-            # Re-measure clipped extents along (right_dir, front_dir) so library units fit strictly inside cur_allowed!
             c_pts = np.asarray(list(clipped.exterior.coords)[:-1], dtype=np.float64)
             sr = (c_pts - center_uv[None, :]) @ right_dir
             sf = (c_pts - center_uv[None, :]) @ front_dir
@@ -503,7 +633,6 @@ def build_cabinet_parts(
                     u_center = center_uv + right_dir * (0.5 * (ur_lo + ur_hi)) + front_dir * (0.5 * (f_lo + f_hi))
                     upoly = _obb_poly(u_center, right_dir, front_dir, unit_w, eff_d)
                     if not cur_allowed.buffer(0.002).contains(upoly):
-                        # Slight inset if angled corner grazes wall
                         upoly_in = _obb_poly(u_center, right_dir, front_dir, unit_w * 0.96, eff_d * 0.96)
                         if not cur_allowed.buffer(0.002).contains(upoly_in):
                             continue
@@ -592,7 +721,7 @@ def build_cabinet_parts(
     return parts, cab_bands, {
         "emitted_cabinets": len(logs),
         "emitted_parts": len(parts),
-        "library_asset_used": cab_asset.asset_id if cab_asset is not None else None,
+        "assets_used": sorted({str(c["asset_id"]) for c in logs if c.get("library_matched")}),
         "cabinets": logs,
         "rejected": rejected,
     }
@@ -697,7 +826,6 @@ def build_sofa_parts(
             logs.append({"sofa_id": sid, "library_matched": True, "asset_id": sofa_asset.asset_id, "obb_ldh_m": [round(length, 3), round(depth, 3), round(h, 3)]})
             continue
 
-        # Clean 4-part closed parametric fallback when library unavailable
         minx, miny, maxx, maxy = clipped.bounds
         w_u, w_v = maxx - minx, maxy - miny
         z_seat = z_floor + min(0.44, max(0.32, 0.50 * h))

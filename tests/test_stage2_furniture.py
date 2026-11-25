@@ -125,3 +125,67 @@ def test_stage2_furniture_zero_penetration_and_multi_chair_splitting(tmp_path: P
     assert furn["cabinets"]["emitted_cabinets"] == 2  # tall cabinet + under-table pedestal, 0 penetration!
     assert furn["sofas"]["emitted_sofas"] == 1  # real sofa emitted, thin false strip rejected!
     assert furn["chairs"]["emitted_chairs"] == 3, furn["chairs"]
+
+
+def test_irregular_l_desk_preserved_and_seat_only_chair_anchored(tmp_path: Path) -> None:
+    # 7m x 6m x 3.2m room with:
+    # 1. A genuine L-shaped executive desk (2.2m x 2.0m with a 1.3m x 1.2m recessed wing cutout) -> must stay irregular_shaped_contour!
+    # 2. A rectangular desk (1.6m x 0.6m) with sparse fringe noise wisps -> must snap cleanly to rectangular!
+    # 3. A seat-only chair (missing backrest, only z=0.45m cushion) right near east wall -> must use seat_anchored mode!
+    floor = _grid_xy(0.0, 7.0, 0.0, 6.0, z=0.0, step=0.08)
+    ceil = _grid_xy(0.0, 7.0, 0.0, 6.0, z=3.2, step=0.08)
+    walls = np.vstack([
+        _grid_wall_x(0.0, 7.0, 0.0, 0.0, 3.2),
+        _grid_wall_x(0.0, 7.0, 6.0, 0.0, 3.2),
+        _grid_wall_y(0.0, 0.0, 6.0, 0.0, 3.2),
+        _grid_wall_y(7.0, 0.0, 6.0, 0.0, 3.2),
+    ])
+
+    # True L-shaped desk: leg A [0.8..3.0, 3.8..4.6] + leg B [0.8..1.6, 2.4..3.8]
+    l_desk = np.vstack([
+        _grid_xy(0.8, 3.0, 3.8, 4.6, z=0.76, step=0.035),
+        _grid_xy(0.8, 1.6, 2.4, 3.8, z=0.76, step=0.035),
+    ])
+    # Rectangular side desk with a tiny sparse noise wisp sticking out on one edge
+    r_desk_main = _grid_xy(4.5, 5.2, 1.0, 2.7, z=0.75, step=0.035)
+    r_desk_wisp = np.array([[5.42, 1.5, 0.74], [5.45, 1.55, 0.74], [5.40, 1.60, 0.74]])
+    r_desk = np.vstack([r_desk_main, r_desk_wisp])
+
+    # Seat-only chair (no backrest above 0.50m!) sitting near east wall facing the side desk
+    chair_post_z = np.arange(0.05, 0.45, 0.03)
+    chair_post = np.column_stack([
+        np.full(len(chair_post_z), 6.40),
+        np.full(len(chair_post_z), 1.80),
+        chair_post_z,
+    ])
+    seat_only_chair = np.vstack([
+        _grid_xy(6.15, 6.65, 1.55, 2.05, z=0.45, step=0.03),
+        _grid_xy(6.18, 6.62, 1.58, 2.02, z=0.42, step=0.035),
+        _grid_xy(6.25, 6.55, 1.65, 1.95, z=0.08, step=0.04),
+        chair_post,
+    ])
+
+    pts = np.vstack([floor, ceil, walls, l_desk, r_desk, seat_only_chair])
+    cls = np.concatenate([
+        np.full(len(floor), 1),
+        np.full(len(ceil), 0),
+        np.full(len(walls), 2),
+        np.full(len(l_desk), 8),
+        np.full(len(r_desk), 8),
+        np.full(len(seat_only_chair), 7),
+    ])
+    las_file = tmp_path / "synth_ldesk_seat_chair.las"
+    _write_las(las_file, pts, cls)
+    out_dir = tmp_path / "out_ld"
+    report = run_pipeline(las_file, out_dir, stage="furniture", library_root=None, render_preview=False)
+
+    assert report["status"] == "PASS", report["relation_audit"]
+    assert report["relation_audit"]["unexpected_penetration_count"] == 0
+    tables = report["furniture"]["tables"]["tables"]
+    assert len(tables) == 2, tables
+    shapes = {t["shape"] for t in tables}
+    assert "irregular_shaped_contour" in shapes, tables
+    assert any("rectangular" in s for s in shapes), tables
+    chairs = report["furniture"]["chairs"]
+    assert chairs["emitted_chairs"] == 1, chairs
+    assert chairs["seat_anchored_count"] == 1, chairs

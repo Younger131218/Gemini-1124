@@ -1,4 +1,4 @@
-"""Read-only GLB model-library loader, SHA-256 verifier, in-memory B21 watertight repair & canonicalizer (B10/B21)."""
+"""Read-only GLB model-library loader, SHA-256 verifier, in-memory B21 watertight repair & multi-asset selector (B10/B21)."""
 
 from __future__ import annotations
 
@@ -30,7 +30,14 @@ class CanonicalLibraryAsset:
     extents_xyz: np.ndarray  # (3,) float64 [width_X, depth_Y, height_Z]
     is_library_mesh: bool = True
     repaired_in_memory: bool = False
+    # Part-level canonical functional references (especially for chairs)
+    backrest_width_m: float = 0.50
     backrest_y_center: float = -0.34
+    seat_width_m: float = 0.56
+    seat_depth_m: float = 0.56
+    seat_y_center: float = 0.0
+    seat_z_center: float = 0.45
+    base_width_m: float = 0.70
 
     def transform_to_uvz(
         self,
@@ -44,7 +51,6 @@ class CanonicalLibraryAsset:
         """Place this canonical asset at (center_uv, z_floor) facing front_dir_uv with bounded (scale_x, scale_y, scale_z)."""
         fy = np.asarray(front_dir_uv, dtype=np.float64)
         fy = fy / max(float(np.linalg.norm(fy)), 1e-9)
-        # Right-handed 2D basis: +X_local -> right = (fy_y, -fy_x), +Y_local -> front = fy
         rx = np.array([fy[1], -fy[0]], dtype=np.float64)
 
         v = self.vertices.copy()
@@ -65,10 +71,7 @@ def repair_mesh_watertight_in_memory(
     *,
     weld_tol: float = 1e-4,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """In-memory B21 watertight manifold repair (weld coincident verts, drop dup/zero faces, cap simple boundary loops).
-
-    Never modifies read-only source GLB files on disk (B04).
-    """
+    """In-memory B21 watertight manifold repair (weld coincident verts, drop dup/zero faces, cap simple boundary loops)."""
     q = np.rint(verts / weld_tol).astype(np.int64)
     _, uniq_idx, inv = np.unique(q, axis=0, return_index=True, return_inverse=True)
     n_u = len(uniq_idx)
@@ -143,7 +146,6 @@ def repair_mesh_watertight_in_memory(
 
 
 def _detect_backrest_on_positive_y(verts_zup: np.ndarray) -> bool:
-    """Detect whether the upper backrest (top 30% Z) lies on +Y (needs 180-deg flip so front=+Y)."""
     z_min, z_max = float(verts_zup[:, 2].min()), float(verts_zup[:, 2].max())
     h = z_max - z_min
     if h < 0.20:
@@ -156,9 +158,7 @@ def _detect_backrest_on_positive_y(verts_zup: np.ndarray) -> bool:
 
 
 def make_fallback_parametric_chair() -> tuple[list[tuple[np.ndarray, np.ndarray, str]], np.ndarray]:
-    """Closed manifold multi-box structural chair (front=+Y, backrest=-Y, W=0.52, D=0.54, H=0.95)
-    used ONLY when local model library is unavailable (e.g. offline CI tests).
-    """
+    """Closed manifold multi-box structural chair used ONLY when local model library is unavailable."""
     parts: list[tuple[np.ndarray, np.ndarray, str]] = []
     parts.append((*make_axis_aligned_box((-0.26, -0.24, 0.42), (0.26, 0.25, 0.49)), "chair_seat"))
     parts.append((*make_axis_aligned_box((-0.25, -0.29, 0.494), (0.25, -0.22, 0.95)), "chair_back"))
@@ -169,7 +169,7 @@ def make_fallback_parametric_chair() -> tuple[list[tuple[np.ndarray, np.ndarray,
 
 
 class FurnitureLibrary:
-    """Verified read-only furniture asset registry with in-memory B21 watertight repair (B10/B21)."""
+    """Verified read-only furniture asset registry with in-memory B21 watertight repair & multi-asset matching."""
 
     def __init__(self, library_root: str | Path | None = None, catalog_path: str | Path | None = None) -> None:
         self.library_root = Path(library_root).resolve() if library_root is not None else None
@@ -194,7 +194,6 @@ class FurnitureLibrary:
         handle_side_xy: np.ndarray | None,
         vcfg: ValidationConfig,
     ) -> dict[str, Any]:
-        # Center XY and ground z_min = 0
         vmin = vz.min(axis=0)
         vmax = vz.max(axis=0)
         cx, cy = 0.5 * (vmin[0] + vmax[0]), 0.5 * (vmin[1] + vmax[1])
@@ -202,40 +201,53 @@ class FurnitureLibrary:
         vz[:, 0] -= cx
         vz[:, 1] -= cy
         vz[:, 2] -= vmin[2]
-        if handle_side_xy is not None:
-            hxy = handle_side_xy - np.array([cx, cy], dtype=np.float64)
-        else:
-            hxy = None
+        hxy = handle_side_xy - np.array([cx, cy], dtype=np.float64) if handle_side_xy is not None else None
 
-        # Canonicalize facing direction to +Y (width along X, depth along Y)
         if cid in (7, 10):
             if _detect_backrest_on_positive_y(vz):
                 vz[:, 0] = -vz[:, 0]
                 vz[:, 1] = -vz[:, 1]
+            # Re-center chair/sofa X onto upper backrest+seat symmetry axis (removes off-center caster star bias!)
+            h_cur = float(vz[:, 2].max())
+            body = vz[vz[:, 2] >= 0.35 * h_cur]
+            if len(body) >= 20:
+                x_sym = 0.5 * (float(body[:, 0].min()) + float(body[:, 0].max()))
+                vz[:, 0] -= x_sym
         elif cid == 9:
-            # For cabinets, ensure width >= depth along X and front door/handle faces +Y!
             ext = vz.max(axis=0) - vz.min(axis=0)
             if ext[1] > ext[0] * 1.15:
-                # Width is currently along Y, depth along X -> rotate +-90 deg around Z so front faces +Y!
                 if hxy is not None and hxy[0] > 0:
-                    # Handle at +X -> rotate +90 deg CCW: (x, y) -> (-y, x) maps +X -> +Y!
                     vz = np.column_stack([-vz[:, 1], vz[:, 0], vz[:, 2]])
                 else:
-                    # Handle at -X -> rotate -90 deg: (x, y) -> (y, -x) maps -X -> +Y!
                     vz = np.column_stack([vz[:, 1], -vz[:, 0], vz[:, 2]])
             elif hxy is not None and hxy[1] < 0:
                 vz[:, 0] = -vz[:, 0]
                 vz[:, 1] = -vz[:, 1]
+        elif cid == 8:
+            # Ensure table long axis is along X (width >= depth)
+            ext = vz.max(axis=0) - vz.min(axis=0)
+            if ext[1] > ext[0] * 1.05:
+                vz = np.column_stack([-vz[:, 1], vz[:, 0], vz[:, 2]])
 
         if signed_mesh_volume(vz, tris) < 0:
             tris = tris[:, [0, 2, 1]]
 
         chk = _check_part_geometry(vz, tris, vcfg)
         ext = vz.max(axis=0) - vz.min(axis=0)
-        # Measure backrest center Y (mean Y of top 30% Z) for accurate backrest-plane anchoring
-        z_hi_cut = float(ext[2]) * 0.70
-        hi_mask = vz[:, 2] >= z_hi_cut
-        back_y_c = float(vz[hi_mask, 1].mean()) if np.any(hi_mask) else -0.35 * float(ext[1])
+        h = float(ext[2])
+
+        # Compute exact part-level functional metrics (base / seat / backrest)
+        base_sl = vz[vz[:, 2] <= 0.30 * h]
+        seat_sl = vz[(vz[:, 2] >= 0.35 * h) & (vz[:, 2] <= 0.55 * h)]
+        back_sl = vz[vz[:, 2] >= 0.68 * h]
+
+        base_w = float(base_sl[:, 0].max() - base_sl[:, 0].min()) if len(base_sl) else float(ext[0])
+        seat_w = float(seat_sl[:, 0].max() - seat_sl[:, 0].min()) if len(seat_sl) else float(ext[0])
+        seat_d = float(seat_sl[:, 1].max() - seat_sl[:, 1].min()) if len(seat_sl) else float(ext[1])
+        seat_yc = float(seat_sl[:, 1].mean()) if len(seat_sl) else 0.0
+        seat_zc = float(seat_sl[:, 2].mean()) if len(seat_sl) else 0.45 * h
+        back_w = float(back_sl[:, 0].max() - back_sl[:, 0].min()) if len(back_sl) else float(ext[0])
+        back_yc = float(back_sl[:, 1].mean()) if len(back_sl) else -0.34 * float(ext[1])
 
         rec = {
             "asset_id": asset_id,
@@ -243,6 +255,14 @@ class FurnitureLibrary:
             "sha256": sha,
             "triangle_count": int(len(tris)),
             "canonical_extents_xyz_m": np.round(ext, 4).tolist(),
+            "part_metrics_m": {
+                "base_w": round(base_w, 3),
+                "seat_w": round(seat_w, 3),
+                "seat_d": round(seat_d, 3),
+                "seat_z": round(seat_zc, 3),
+                "back_w": round(back_w, 3),
+                "back_y": round(back_yc, 3),
+            },
             "repaired_in_memory": repaired,
             "b21_watertight_passed": bool(chk["passed"]),
             "boundary_half_edges": int(chk.get("boundary_half_edges", 0)),
@@ -265,7 +285,13 @@ class FurnitureLibrary:
                     extents_xyz=ext,
                     is_library_mesh=True,
                     repaired_in_memory=repaired,
-                    backrest_y_center=back_y_c,
+                    backrest_width_m=back_w,
+                    backrest_y_center=back_yc,
+                    seat_width_m=seat_w,
+                    seat_depth_m=seat_d,
+                    seat_y_center=seat_yc,
+                    seat_z_center=seat_zc,
+                    base_width_m=base_w,
                 )
             )
         return rec
@@ -287,21 +313,12 @@ class FurnitureLibrary:
             cid = int(entry.get("class_id", 0))
             if cid not in (7, 8, 9, 10):
                 continue
-            # Skip oversized/prop-contaminated assets (B10: never import props/backdrops/plants!)
             ext_meta = entry.get("normalized_extent_xyz_m", [0, 0, 0])
             if cid == 8 and float(ext_meta[1]) > 1.50:
-                self.audit_entries.append({
-                    "asset_id": entry["asset_id"],
-                    "class_id": cid,
-                    "status": "skipped_contains_props_b10",
-                })
+                self.audit_entries.append({"asset_id": entry["asset_id"], "class_id": cid, "status": "skipped_contains_props_b10"})
                 continue
             if cid == 10 and float(ext_meta[1]) > 1.30:
-                self.audit_entries.append({
-                    "asset_id": entry["asset_id"],
-                    "class_id": cid,
-                    "status": "skipped_contains_props_b10",
-                })
+                self.audit_entries.append({"asset_id": entry["asset_id"], "class_id": cid, "status": "skipped_contains_props_b10"})
                 continue
 
             rel = str(entry["relative_path"])
@@ -321,11 +338,9 @@ class FurnitureLibrary:
             if len(v_raw) == 0 or len(t_raw) == 0:
                 continue
 
-            # Convert glTF Y-up -> Z-up: (x, y, z)_yup -> (x, -z, y)_zup
             vz = np.column_stack([v_raw[:, 0], -v_raw[:, 2], v_raw[:, 1]]).astype(np.float64) * scale_m
             tris = t_raw.astype(np.uint32).copy()
 
-            # 1. Try raw unmodified mesh first
             chk_raw = _check_part_geometry(vz, tris, vcfg)
             if chk_raw["passed"]:
                 rec = self._canonicalize_and_register(
@@ -334,7 +349,6 @@ class FurnitureLibrary:
                 self.audit_entries.append(rec)
                 continue
 
-            # 2. Try in-memory B21 watertight repair on the main structural body primitive (excludes tiny unclosed decals)
             parsed = load_glb(fpath)
             best_prim = None
             best_vol_box = 0.0
@@ -347,7 +361,6 @@ class FurnitureLibrary:
                     best_vol_box = vbox
                     best_prim = (pv, pr.indices.astype(np.uint32))
                 elif cid == 9 and vbox < 0.01 and float(pext[2]) < 0.25:
-                    # Small metallic handle/lock primitive indicates the exact front door face!
                     handle_xy = pv[:, :2].mean(axis=0)
 
             if best_prim is not None and len(best_prim[1]) <= 15000:
@@ -364,9 +377,50 @@ class FurnitureLibrary:
                     "status": "rejected_non_watertight_b21",
                 })
 
+    def get_assets(self, class_id: int) -> list[CanonicalLibraryAsset]:
+        return list(self.verified_assets.get(class_id, []))
+
     def get_best_asset(self, class_id: int) -> CanonicalLibraryAsset | None:
         pool = self.verified_assets.get(class_id, [])
         return pool[0] if pool else None
+
+    def rank_assets(
+        self,
+        class_id: int,
+        target_wdh: tuple[float, float, float],
+        *,
+        back_width_m: float | None = None,
+        seat_only: bool = False,
+    ) -> list[CanonicalLibraryAsset]:
+        """Rank all verified library assets for class_id by geometric similarity to measured dimensions (B10)."""
+        pool = self.verified_assets.get(class_id, [])
+        if len(pool) <= 1:
+            return list(pool)
+
+        tw, td, th = float(target_wdh[0]), float(target_wdh[1]), float(target_wdh[2])
+
+        def _score(a: CanonicalLibraryAsset) -> float:
+            aw, ad, ah = float(a.extents_xyz[0]), float(a.extents_xyz[1]), float(a.extents_xyz[2])
+            if class_id == 7:
+                # Match chair height + backrest-width-to-height proportion!
+                h_err = abs(ah - th) / max(th, 0.5)
+                if seat_only:
+                    # Compact lower-profile modern chair is ideal when backrest is low/missing
+                    return h_err + 0.35 * abs(a.seat_width_m - tw) / max(tw, 0.35) + (0.0 if ah <= 1.02 else 0.30)
+                if back_width_m is not None and back_width_m >= 0.30:
+                    target_ratio = back_width_m / max(th, 0.5)
+                    asset_ratio = a.backrest_width_m / max(ah, 0.5)
+                    # Penalize wide wheel base relative to narrow backrest (prevents skinny backrest + bloated wheels!)
+                    base_bloat = max(0.0, (a.base_width_m / max(a.backrest_width_m, 0.30)) - 1.35) * 0.45
+                    return 1.4 * abs(asset_ratio - target_ratio) + 0.8 * h_err + base_bloat
+                return h_err + 0.5 * abs(a.seat_width_m - tw) / max(tw, 0.35)
+            # Cabinets / tables / sofas: match aspect & height ratios
+            d_err = abs(ad - td) / max(td, 0.25)
+            h_err = abs(ah - th) / max(th, 0.40)
+            w_err = abs(aw - tw) / max(tw, 0.35)
+            return d_err + h_err + 0.4 * w_err
+
+        return sorted(pool, key=_score)
 
     def to_audit_dict(self) -> dict[str, Any]:
         return {
