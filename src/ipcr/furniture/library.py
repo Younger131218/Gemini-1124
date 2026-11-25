@@ -115,7 +115,10 @@ def repair_mesh_watertight_in_memory(
                 next_map[w].append(u)
 
     cap_tris: list[tuple[int, int, int]] = []
+    cap_area = 0.0
     verts_list = [new_v[i] for i in range(len(new_v))]
+    v0_w, v1_w, v2_w = new_v[wt[:, 0]], new_v[wt[:, 1]], new_v[wt[:, 2]]
+    orig_area = float(0.5 * np.linalg.norm(np.cross(v1_w - v0_w, v2_w - v0_w), axis=1).sum())
     while True:
         start = next((k for k, vs in next_map.items() if vs), None)
         if start is None:
@@ -130,19 +133,69 @@ def repair_mesh_watertight_in_memory(
             cur = next_map[cur].pop()
             guard += 1
         if cur == start and len(loop) >= 3:
+            pts_lp = np.asarray([verts_list[i] for i in loop], dtype=np.float64)
+            c_pos = pts_lp.mean(axis=0)
+            # Only cap genuinely planar holes (max out-of-plane error <= 0.02m);
+            # NEVER fan-cap a huge 3D non-planar open shell rim into a sunken funnel!
+            if len(loop) > 3:
+                _, _, vh = np.linalg.svd(pts_lp - c_pos, full_matrices=False)
+                max_plane_err = float(np.max(np.abs((pts_lp - c_pos) @ vh[-1])))
+                if max_plane_err > 0.02:
+                    continue
             c_idx = len(verts_list)
-            c_pos = np.mean([verts_list[i] for i in loop], axis=0)
             verts_list.append(c_pos)
             for i in range(len(loop)):
                 a = loop[i]
                 b = loop[(i + 1) % len(loop)]
                 cap_tris.append((a, b, c_idx))
+                cap_area += 0.5 * float(np.linalg.norm(np.cross(verts_list[a] - c_pos, verts_list[b] - c_pos)))
+
+    # Reject synthetic caps that had to invent > 25% of the entire surface area
+    if cap_tris and orig_area > 1e-6 and (cap_area / orig_area) > 0.25:
+        cap_tris = []
+        verts_list = [new_v[i] for i in range(len(new_v))]
 
     out_v = np.asarray(verts_list, dtype=np.float64)
     out_t = np.vstack([wt, np.asarray(cap_tris, dtype=np.uint32)]) if cap_tris else wt
     if signed_mesh_volume(out_v, out_t) < 0:
         out_t = out_t[:, [0, 2, 1]]
     return out_v, out_t
+
+
+def _check_cabinet_six_faces_solid(vz: np.ndarray, tris: np.ndarray, *, min_ratio: float = 0.25) -> tuple[bool, dict[str, float]]:
+    """Audit all 6 outer faces of a Class 9 cabinet so open-top / open-back hollow shells can NEVER pass."""
+    if len(tris) == 0:
+        return False, {}
+    vmin = vz.min(axis=0)
+    vmax = vz.max(axis=0)
+    ext = vmax - vmin
+    if np.any(ext < 1e-3):
+        return False, {}
+    v0, v1, v2 = vz[tris[:, 0]], vz[tris[:, 1]], vz[tris[:, 2]]
+    n = np.cross(v1 - v0, v2 - v0)
+    norms = np.linalg.norm(n, axis=1)
+    areas = 0.5 * norms
+    nu = n / np.maximum(norms[:, None], 1e-12)
+    c = (v0 + v1 + v2) / 3.0
+
+    tol_x, tol_y, tol_z = max(0.05, 0.12 * ext[0]), max(0.05, 0.12 * ext[1]), max(0.05, 0.12 * ext[2])
+    checks = [
+        ("top_pz", c[:, 2] >= vmax[2] - tol_z, 2, +1, float(ext[0] * ext[1])),
+        ("bot_nz", c[:, 2] <= vmin[2] + tol_z, 2, -1, float(ext[0] * ext[1])),
+        ("front_py", c[:, 1] >= vmax[1] - tol_y, 1, +1, float(ext[0] * ext[2])),
+        ("back_ny", c[:, 1] <= vmin[1] + tol_y, 1, -1, float(ext[0] * ext[2])),
+        ("left_nx", c[:, 0] <= vmin[0] + tol_x, 0, -1, float(ext[1] * ext[2])),
+        ("right_px", c[:, 0] >= vmax[0] - tol_x, 0, +1, float(ext[1] * ext[2])),
+    ]
+    ratios: dict[str, float] = {}
+    ok = True
+    for name, mask, axis, sgn, box_a in checks:
+        out_a = float(areas[mask & (nu[:, axis] * sgn > 0.65)].sum())
+        r = out_a / max(box_a, 1e-6)
+        ratios[name] = round(r, 3)
+        if r < min_ratio:
+            ok = False
+    return ok, ratios
 
 
 def _detect_backrest_on_positive_y(verts_zup: np.ndarray) -> bool:
@@ -223,6 +276,15 @@ class FurnitureLibrary:
             elif hxy is not None and hxy[1] < 0:
                 vz[:, 0] = -vz[:, 0]
                 vz[:, 1] = -vz[:, 1]
+            elif hxy is None:
+                # Orient front doors/handles (+Y) by comparing detail vertex density near -Y vs +Y face
+                ymin_c, ymax_c = float(vz[:, 1].min()), float(vz[:, 1].max())
+                d_c = max(ymax_c - ymin_c, 1e-4)
+                n_neg = int(np.sum(vz[:, 1] <= ymin_c + 0.08 * d_c))
+                n_pos = int(np.sum(vz[:, 1] >= ymax_c - 0.08 * d_c))
+                if n_neg > n_pos * 1.5:
+                    vz[:, 0] = -vz[:, 0]
+                    vz[:, 1] = -vz[:, 1]
         elif cid == 8:
             # Ensure table long axis is along X (width >= depth)
             ext = vz.max(axis=0) - vz.min(axis=0)
@@ -233,6 +295,11 @@ class FurnitureLibrary:
             tris = tris[:, [0, 2, 1]]
 
         chk = _check_part_geometry(vz, tris, vcfg)
+        six_face_ok = True
+        six_face_ratios: dict[str, float] = {}
+        if cid == 9 and chk["passed"]:
+            six_face_ok, six_face_ratios = _check_cabinet_six_faces_solid(vz, tris, min_ratio=0.25)
+        passed_all = bool(chk["passed"]) and six_face_ok
         ext = vz.max(axis=0) - vz.min(axis=0)
         h = float(ext[2])
 
@@ -265,15 +332,21 @@ class FurnitureLibrary:
             },
             "repaired_in_memory": repaired,
             "b21_watertight_passed": bool(chk["passed"]),
+            "six_face_solid_passed": bool(six_face_ok),
+            "six_face_ratios": six_face_ratios,
             "boundary_half_edges": int(chk.get("boundary_half_edges", 0)),
             "non_manifold_edges": int(chk.get("non_manifold_edges", 0)),
             "status": (
                 "verified_ready_repaired"
-                if (chk["passed"] and repaired)
-                else ("verified_ready_raw" if chk["passed"] else "rejected_non_watertight_b21")
+                if (passed_all and repaired)
+                else (
+                    "verified_ready_raw"
+                    if passed_all
+                    else ("rejected_hollow_missing_face" if not six_face_ok else "rejected_non_watertight_b21")
+                )
             ),
         }
-        if chk["passed"]:
+        if passed_all:
             self.verified_assets[cid].append(
                 CanonicalLibraryAsset(
                     asset_id=asset_id,
@@ -349,22 +422,42 @@ class FurnitureLibrary:
                 self.audit_entries.append(rec)
                 continue
 
+            # Step 2: Repair FULL merged mesh first so NO structural primitive (cabinet lid/back/doors) is ever dropped!
+            if len(tris) <= 65000:
+                rv_full, rt_full = repair_mesh_watertight_in_memory(vz, tris)
+                chk_full = _check_part_geometry(rv_full, rt_full, vcfg)
+                if chk_full["passed"]:
+                    rec = self._canonicalize_and_register(
+                        str(entry["asset_id"]), cid, rel, actual_sha, rv_full, rt_full, True, None, vcfg
+                    )
+                    self.audit_entries.append(rec)
+                    continue
+
+            # Step 3: If tiny decorative sub-meshes (keyholes/handles < 2% bbox volume) broke manifoldness,
+            # merge ALL major structural primitives (>= 2% of max primitive bbox volume) — NEVER keep only 1 primitive!
             parsed = load_glb(fpath)
-            best_prim = None
-            best_vol_box = 0.0
+            prim_items: list[tuple[float, np.ndarray, np.ndarray, np.ndarray]] = []
             handle_xy = None
             for pr in parsed.primitives:
                 pv = np.column_stack([pr.positions[:, 0], -pr.positions[:, 2], pr.positions[:, 1]]).astype(np.float64) * scale_m
                 pext = pv.max(axis=0) - pv.min(axis=0)
                 vbox = float(pext[0] * pext[1] * pext[2])
-                if vbox > best_vol_box:
-                    best_vol_box = vbox
-                    best_prim = (pv, pr.indices.astype(np.uint32))
-                elif cid == 9 and vbox < 0.01 and float(pext[2]) < 0.25:
+                prim_items.append((vbox, pv, pr.indices.astype(np.uint32), pext))
+                if cid == 9 and vbox < 0.01 and float(pext[2]) < 0.25:
                     handle_xy = pv[:, :2].mean(axis=0)
 
-            if best_prim is not None and len(best_prim[1]) <= 15000:
-                rv, rt = repair_mesh_watertight_in_memory(best_prim[0], best_prim[1])
+            max_vbox = max((it[0] for it in prim_items), default=0.0)
+            major = [it for it in prim_items if max_vbox > 0.0 and it[0] >= 0.02 * max_vbox]
+            total_major_tris = sum(len(it[2]) for it in major)
+            if major and total_major_tris <= 65000:
+                vs_m: list[np.ndarray] = []
+                ts_m: list[np.ndarray] = []
+                v_off = 0
+                for _, pv, pt, _ in major:
+                    vs_m.append(pv)
+                    ts_m.append(pt + v_off)
+                    v_off += len(pv)
+                rv, rt = repair_mesh_watertight_in_memory(np.vstack(vs_m), np.vstack(ts_m))
                 rec = self._canonicalize_and_register(
                     str(entry["asset_id"]), cid, rel, actual_sha, rv, rt, True, handle_xy, vcfg
                 )

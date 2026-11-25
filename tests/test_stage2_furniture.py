@@ -189,3 +189,44 @@ def test_irregular_l_desk_preserved_and_seat_only_chair_anchored(tmp_path: Path)
     chairs = report["furniture"]["chairs"]
     assert chairs["emitted_chairs"] == 1, chairs
     assert chairs["seat_anchored_count"] == 1, chairs
+
+
+def test_square_table_obb_avoids_pca_tilt_and_preserves_angled_desk() -> None:
+    from ipcr.furniture.tables_cabinets_sofas import _fit_obb_2d
+
+    # 1. Near-square 1.6m x 1.6m table with heavy corner density bias (PCA would tilt ~45 deg!)
+    base_sq = _grid_xy(0.0, 1.6, 0.0, 1.6, z=0.0, step=0.04)[:, :2]
+    corner_bias = _grid_xy(0.0, 0.45, 0.0, 0.45, z=0.0, step=0.015)[:, :2]
+    corner_bias2 = _grid_xy(1.15, 1.6, 1.15, 1.6, z=0.0, step=0.015)[:, :2]
+    sq_pts = np.vstack([base_sq, corner_bias, corner_bias2])
+    _, long_dir, _, L, D = _fit_obb_2d(sq_pts, snap_deg=12.0)
+    # Must snap cleanly to room axes (0 or 90 deg), NEVER diagonal!
+    assert max(abs(long_dir[0]), abs(long_dir[1])) > 0.99, (long_dir, L, D)
+    assert 1.45 <= L <= 1.65 and 1.45 <= D <= 1.65
+
+    # 2. Genuinely 30-deg rotated rectangular desk (2.0m x 0.75m) -> must keep ~30-deg angle!
+    rect = _grid_xy(-1.0, 1.0, -0.375, 0.375, z=0.0, step=0.04)[:, :2]
+    ang = np.radians(30.0)
+    rot = np.array([[np.cos(ang), -np.sin(ang)], [np.sin(ang), np.cos(ang)]])
+    rot_pts = rect @ rot.T
+    _, r_dir, _, rL, rD = _fit_obb_2d(rot_pts, snap_deg=12.0)
+    dot_30 = abs(float(r_dir @ np.array([np.cos(ang), np.sin(ang)])))
+    assert dot_30 > 0.98, (r_dir, dot_30, rL, rD)
+    assert 1.85 <= rL <= 2.05 and 0.65 <= rD <= 0.80
+
+
+def test_cabinet_six_face_solidity_gate_rejects_hollow_open_top() -> None:
+    from ipcr.furniture.library import _check_cabinet_six_faces_solid
+    from ipcr.geometry_primitives import make_axis_aligned_box
+
+    v, t = make_axis_aligned_box((0.0, 0.0, 0.0), (1.0, 0.5, 2.0))
+    ok_full, ratios_full = _check_cabinet_six_faces_solid(v, t)
+    assert ok_full, ratios_full
+
+    # Strip the top (+Z) faces -> must be rejected as hollow!
+    v0, v1, v2 = v[t[:, 0]], v[t[:, 1]], v[t[:, 2]]
+    n = np.cross(v1 - v0, v2 - v0)
+    nu = n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
+    t_no_top = t[nu[:, 2] < 0.5]
+    ok_hollow, ratios_hollow = _check_cabinet_six_faces_solid(v, t_no_top)
+    assert not ok_hollow and ratios_hollow["top_pz"] == 0.0, ratios_hollow

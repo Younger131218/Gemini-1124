@@ -146,27 +146,89 @@ def _extract_dense_core_uv(pts_uv: np.ndarray, *, cell: float = 0.08) -> np.ndar
 
 
 def _fit_obb_2d(pts_uv: np.ndarray, snap_deg: float = 12.0) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
-    """Fit clean 2D OBB returning (center_uv, long_dir, depth_dir, length, depth)."""
-    mean_uv = pts_uv.mean(axis=0)
-    centered = pts_uv - mean_uv
-    cov = (centered.T @ centered) / max(len(pts_uv), 1)
-    _, eigvecs = np.linalg.eigh(cov)
-    long_dir = eigvecs[:, 1].copy()
-    long_dir /= max(float(np.linalg.norm(long_dir)), 1e-9)
+    """Fit minimum-area 2D OBB via convex-hull edge search (avoids 1:1 square PCA tilt degeneracy!)."""
+    pts = np.asarray(pts_uv, dtype=np.float64)
+    if len(pts) < 4:
+        c = pts.mean(axis=0) if len(pts) else np.zeros(2, dtype=np.float64)
+        return c, np.array([1.0, 0.0]), np.array([0.0, 1.0]), 0.1, 0.1
 
+    mean_uv = pts.mean(axis=0)
+    centered = pts - mean_uv
+
+    # Gather candidate angles: room axis (0 deg) + every 2D convex hull edge direction
+    cand_dirs: list[np.ndarray] = [np.array([1.0, 0.0], dtype=np.float64)]
+    try:
+        from shapely.geometry import MultiPoint
+
+        hull = MultiPoint(pts).convex_hull
+        if isinstance(hull, Polygon) and not hull.is_empty:
+            coords = np.asarray(hull.exterior.coords, dtype=np.float64)
+            edges = np.diff(coords, axis=0)
+            lens = np.linalg.norm(edges, axis=1)
+            for e, el in zip(edges, lens):
+                if el > 1e-4:
+                    u = e / el
+                    if u[0] < 0 or (abs(u[0]) < 1e-9 and u[1] < 0):
+                        u = -u
+                    cand_dirs.append(u)
+    except Exception:
+        pass
+
+    # Deduplicate candidate angles to ~1 deg resolution so evaluation is instant
+    seen_deg: set[int] = set()
+    uniq_dirs: list[np.ndarray] = []
+    for d in cand_dirs:
+        ang = int(round(np.degrees(np.arctan2(d[1], d[0])) % 90.0))
+        if ang not in seen_deg:
+            seen_deg.add(ang)
+            uniq_dirs.append(d)
+
+    def _eval_dir(d: np.ndarray) -> tuple[float, float, float, float, float, float]:
+        n = np.array([-d[1], d[0]], dtype=np.float64)
+        sl = centered @ d
+        sd = centered @ n
+        l0, l1 = float(np.percentile(sl, 2)), float(np.percentile(sl, 98))
+        d0, d1 = float(np.percentile(sd, 2)), float(np.percentile(sd, 98))
+        L = max(l1 - l0, 1e-4)
+        D = max(d1 - d0, 1e-4)
+        return L * D, l0, l1, d0, d1, L
+
+    best_d = uniq_dirs[0]
+    best_eval = _eval_dir(best_d)
+    axis_eval = best_eval  # uniq_dirs[0] is [1.0, 0.0]
+
+    for d in uniq_dirs[1:]:
+        ev = _eval_dir(d)
+        if ev[0] < best_eval[0]:
+            best_eval = ev
+            best_d = d
+
+    # Snap to room axes if within snap_deg OR if room-axis area is within 6% of minimum rotated area
     cos_s = float(np.cos(np.radians(snap_deg)))
+    snapped = False
     for ax in (np.array([1.0, 0.0]), np.array([-1.0, 0.0]), np.array([0.0, 1.0]), np.array([0.0, -1.0])):
-        if float(np.dot(long_dir, ax)) >= cos_s:
-            long_dir = ax.copy()
+        if float(np.dot(best_d, ax)) >= cos_s:
+            best_d = np.array([1.0, 0.0], dtype=np.float64)
+            best_eval = axis_eval
+            snapped = True
             break
-    depth_dir = np.array([-long_dir[1], long_dir[0]], dtype=np.float64)
+    if not snapped and axis_eval[0] <= best_eval[0] * 1.06:
+        best_d = np.array([1.0, 0.0], dtype=np.float64)
+        best_eval = axis_eval
 
-    sl = centered @ long_dir
-    sd = centered @ depth_dir
-    l0, l1 = float(np.percentile(sl, 2)), float(np.percentile(sl, 98))
-    d0, d1 = float(np.percentile(sd, 2)), float(np.percentile(sd, 98))
+    _, l0, l1, d0, d1, _ = best_eval
+    long_dir = best_d.copy()
+    depth_dir = np.array([-long_dir[1], long_dir[0]], dtype=np.float64)
+    length = l1 - l0
+    depth = d1 - d0
     center = mean_uv + long_dir * (0.5 * (l0 + l1)) + depth_dir * (0.5 * (d0 + d1))
-    return center, long_dir, depth_dir, l1 - l0, d1 - d0
+
+    # Ensure long_dir always aligns with the longer side (length >= depth)
+    if depth > length:
+        long_dir, depth_dir = depth_dir, -long_dir
+        length, depth = depth, length
+
+    return center, long_dir, depth_dir, float(length), float(depth)
 
 
 def _obb_poly(center: np.ndarray, long_dir: np.ndarray, depth_dir: np.ndarray, length: float, depth: float) -> Polygon:
