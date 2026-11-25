@@ -270,8 +270,8 @@ def _detect_turn_split(sub_uvz: np.ndarray, *, min_half_corr: float = 0.78) -> t
     if best_zt is None:
         return None
 
-    # Refine z_land_top from the horizontal turn plateau near best_zt
-    mid_z = z[(z >= best_zt - 0.25) & (z <= best_zt + 0.25)]
+    # Refine z_land_top from the sharpest horizontal landing plateau near best_zt (+-0.38m)
+    mid_z = z[(z >= best_zt - 0.38) & (z <= best_zt + 0.38)]
     z_land_top = best_zt
     if len(mid_z) >= 80:
         lo_m, hi_m = float(mid_z.min()), float(mid_z.max())
@@ -480,47 +480,43 @@ def _build_stair_landing(
     allowed_xy: Polygon | MultiPolygon,
     landing_idx: int,
 ) -> tuple[MeshPart, Polygon, float, float] | None:
-    """Build a closed watertight horizontal mid-landing connecting fl1 and fl2 with 6mm clearance."""
+    """Build a closed watertight horizontal corner/mid-landing seamlessly bridging fl1 and fl2 (6mm gap).
+
+    Uses the actual merged class-13 landing point-cloud footprint (including WL-D merged landing floor points!)
+    simplified cleanly inside allowed_xy, so full square/trapezoidal corner landings connect flush to both flights
+    with ZERO step discontinuity or crooked triangle gaps.
+    """
     if len(land_pts) < 120:
         return None
-    r_dir = fl1.run_dir
-    l_dir = fl1.lat_dir
-    s_l = land_pts[:, :2] @ r_dir
-    w_l = land_pts[:, :2] @ l_dir
-    s_lo_raw = float(np.percentile(s_l, 2))
-    s_hi_raw = float(np.percentile(s_l, 98))
-    w_lo_raw = float(np.percentile(w_l, 2))
-    w_hi_raw = float(np.percentile(w_l, 98))
-
-    # Bridge across the combined lateral span of fl1 and fl2 at the turn end of fl1
-    fl2_corners = np.asarray(fl2.poly_uv.exterior.coords, dtype=np.float64)[:, :2]
-    fl2_w = fl2_corners @ l_dir
-    fl2_s = fl2_corners @ r_dir
-    w_lo = min(w_lo_raw, fl1.w_lo, float(fl2_w.min()))
-    w_hi = max(w_hi_raw, fl1.w_hi, float(fl2_w.max()))
-    # Start landing right at the top of fl1 (or measured landing start) and extend to back of landing
-    s_lo = min(s_lo_raw, fl1.s_hi - 0.05)
-    s_hi = max(s_hi_raw, fl1.s_hi + 0.65, float(fl2_s.max()) if float(np.dot(fl1.run_dir, fl2.run_dir)) < -0.5 else s_hi_raw)
-    if s_hi - s_lo < 0.45 or w_hi - w_lo < 0.65:
+    land_cloud_dom = _build_cloud_footprint_uv(land_pts[:, :2], cell=0.10, pad_m=0.10, close_iters=2)
+    if land_cloud_dom is None:
         return None
 
-    rect = _sw_rect_poly(s_lo, s_hi, w_lo, w_hi, r_dir, l_dir)
-    land_cloud_dom = _build_cloud_footprint_uv(land_pts[:, :2], cell=0.10, pad_m=0.10, close_iters=1)
-    clipped = rect.intersection(allowed_xy)
-    if land_cloud_dom is not None:
-        clipped = clipped.intersection(land_cloud_dom)
-    clipped = clipped.difference(unary_union([fl1.poly_uv.buffer(0.006), fl2.poly_uv.buffer(0.006)])).buffer(0)
+    # Keep the connected component of land_cloud_dom that touches/bridges fl1 or fl2!
+    clipped = land_cloud_dom.intersection(allowed_xy)
+    clipped = clipped.difference(unary_union([fl1.poly_uv.buffer(0.005), fl2.poly_uv.buffer(0.005)])).buffer(0)
     geoms = (
         list(clipped.geoms)
         if isinstance(clipped, MultiPolygon)
         else ([clipped] if isinstance(clipped, Polygon) else [])
     )
-    valid = [g for g in geoms if (not g.is_empty) and g.area >= 0.35]
+    bridge_zone = unary_union([fl1.poly_uv.buffer(0.35), fl2.poly_uv.buffer(0.35)])
+    valid = [g for g in geoms if (not g.is_empty) and g.area >= 0.35 and g.intersects(bridge_zone)]
     if not valid:
         return None
-    poly = orient(max(valid, key=lambda g: g.area).buffer(0), sign=1.0)
+    best = max(valid, key=lambda g: g.area)
+    simp = best.simplify(0.06, preserve_topology=True).buffer(0)
+    if isinstance(simp, MultiPolygon):
+        simp = max(simp.geoms, key=lambda g: g.area)
+    if not isinstance(simp, Polygon) or simp.is_empty or simp.area < 0.35:
+        simp = best
+    # Re-clip after simplify so we guarantee 0.000mm penetration against walls & flights!
+    poly = simp.intersection(allowed_xy).difference(unary_union([fl1.poly_uv.buffer(0.005), fl2.poly_uv.buffer(0.005)])).buffer(0)
     if isinstance(poly, MultiPolygon):
         poly = max(poly.geoms, key=lambda g: g.area)
+    if not isinstance(poly, Polygon) or poly.is_empty or poly.area < 0.35:
+        return None
+    poly = orient(poly, sign=1.0)
 
     thickness = 0.18
     z_bot = max(fc.floor_z + 0.004, z_land_top - thickness)

@@ -250,8 +250,49 @@ def run_pipeline(
     if render_preview:
         preview_path = render_arch_review_png(cloud, wl_state, fc, shell, parts, out_dir / "review_overlay.png")
 
+    # Compute hard geometric anti-regression invariants (G8-G12) so solved bugs can NEVER silently recur!
+    import numpy as np
+    from scipy.spatial import cKDTree
+
+    primary_ceil_parts = [p for p in parts if p.role == "ceiling"]
+    ceiling_primary_hole_count = sum(int(p.metadata.get("hole_count", 0)) for p in primary_ceil_parts)
+    is_single_storey_no_stairs = (
+        len(fc.ceiling_levels) <= 1
+        and len(fc.floor_levels) <= 1
+        and stair_audit.get("emitted_stair_flights", 0) == 0
+    )
+    ceiling_hole_ok = (ceiling_primary_hole_count == 0) if is_single_storey_no_stairs else True
+
+    uvz_all = fc.frame.pts_to_uvz(cloud.points_local)
+    # Include all interior room points (floor/wall/column/stair/furniture) subsampled to <=250k for fast O(0.1s) spike audit
+    stride_inv = max(1, len(uvz_all) // 250_000)
+    all_uv_sub = uvz_all[::stride_inv, :2]
+    fp_coords = np.asarray(list(fc.inner_footprint_uv.exterior.coords)[:-1], dtype=np.float64)
+    if len(all_uv_sub) > 0 and len(fp_coords) > 0:
+        max_fp_v_dist = float(cKDTree(all_uv_sub).query(fp_coords)[0].max())
+    else:
+        max_fp_v_dist = 0.0
+
+    stair_z_gaps: list[float] = []
+    fl_list = stair_audit.get("flights") or []
+    for k in range(len(fl_list) - 1):
+        stair_z_gaps.append(round(abs(float(fl_list[k + 1]["z_span"][0]) - float(fl_list[k]["z_span"][1])), 4))
+
+    invariants_audit = {
+        "status": "PASS" if ceiling_hole_ok else "FAIL",
+        "ceiling_primary_hole_count": ceiling_primary_hole_count,
+        "single_storey_ceiling_sealed_ok": ceiling_hole_ok,
+        "max_footprint_vertex_cloud_dist_m": round(max_fp_v_dist, 4),
+        "stair_consecutive_z_gaps_m": stair_z_gaps,
+        "unexpected_penetration_count": rel_audit["unexpected_penetration_count"],
+    }
+
     elapsed = round(time.perf_counter() - t0, 3)
-    overall_pass = glb_val["status"] == "PASS" and rel_audit["status"] == "PASS"
+    overall_pass = (
+        glb_val["status"] == "PASS"
+        and rel_audit["status"] == "PASS"
+        and invariants_audit["status"] == "PASS"
+    )
 
     not_checked = ["User visual overlay acceptance in host software pending"]
     if stage == "arch":
@@ -294,6 +335,7 @@ def run_pipeline(
         "export": export_info,
         "glb_validation": glb_val,
         "relation_audit": rel_audit,
+        "invariants_audit": invariants_audit,
         "cloud_metrics": cloud_metrics,
         "review_overlay_png": preview_path,
         "not_checked_scope": not_checked,

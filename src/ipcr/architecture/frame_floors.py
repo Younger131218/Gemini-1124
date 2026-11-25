@@ -376,14 +376,80 @@ def _extract_level_polygon_uv(band_uv: np.ndarray, *, cell: float = 0.12) -> Pol
     return _snap_orthogonal_polygon(raw, simplify_tol=0.14)
 
 
+def _merge_collinear_wall_edges(
+    poly_uv: Polygon,
+    wall_uvz: np.ndarray,
+    *,
+    max_angle_diff_deg: float = 14.0,
+    max_line_dev_m: float = 0.14,
+) -> Polygon:
+    """Straighten nearly-collinear slanted wall chains into clean single walls without losing true alcoves."""
+    coords = np.asarray(list(orient(poly_uv, sign=1.0).exterior.coords)[:-1], dtype=np.float64)
+    if len(coords) < 5 or len(wall_uvz) < 200:
+        return poly_uv
+
+    wall_uv = wall_uvz[:, :2]
+    cos_min = float(np.cos(np.radians(max_angle_diff_deg)))
+
+    for _ in range(12):
+        n = len(coords)
+        if n < 5:
+            break
+        merged = False
+        for i in range(n):
+            p_prev = coords[(i - 1) % n]
+            p_cur = coords[i]
+            p_next = coords[(i + 1) % n]
+            e1 = p_cur - p_prev
+            e2 = p_next - p_cur
+            l1 = float(np.linalg.norm(e1))
+            l2 = float(np.linalg.norm(e2))
+            if l1 < 0.08 or l2 < 0.08:
+                continue
+            t1 = e1 / l1
+            t2 = e2 / l2
+            if float(np.dot(t1, t2)) < cos_min:
+                continue
+            # Check perpendicular deviation of intermediate vertex p_cur from chord p_prev -> p_next
+            chord = p_next - p_prev
+            l_ch = float(np.linalg.norm(chord))
+            if l_ch < 0.20:
+                continue
+            t_ch = chord / l_ch
+            n_ch = np.array([t_ch[1], -t_ch[0]], dtype=np.float64)
+            v_dev = abs(float(np.dot(p_cur - p_prev, n_ch)))
+            if v_dev > 0.24:
+                continue
+            # Verify wall points along the chord sit closely along the single straight line
+            rel = wall_uv - p_prev[None, :]
+            s_p = rel @ t_ch
+            d_p = np.abs(rel @ n_ch)
+            near = (s_p >= 0.0) & (s_p <= l_ch) & (d_p <= 0.35)
+            if int(np.sum(near)) >= 120:
+                if float(np.percentile(d_p[near], 80)) > max_line_dev_m:
+                    continue
+            new_list = [coords[k] for k in range(n) if k != i]
+            cand = Polygon(new_list).buffer(0)
+            if isinstance(cand, MultiPolygon):
+                cand = max(cand.geoms, key=lambda g: g.area)
+            if not cand.is_empty and cand.area >= poly_uv.area * 0.94:
+                coords = np.asarray(list(orient(cand, sign=1.0).exterior.coords)[:-1], dtype=np.float64)
+                merged = True
+                break
+        if not merged:
+            break
+    return orient(Polygon(coords).buffer(0), sign=1.0)
+
+
 def _refine_footprint_edges_to_walls(
     poly_uv: Polygon,
     wall_uvz: np.ndarray,
     *,
-    search_band_m: float = 0.35,
+    search_band_m: float = 0.30,
     min_support_pts: int = 80,
+    support_cloud_uv: np.ndarray | None = None,
 ) -> tuple[Polygon, list[dict[str, Any]]]:
-    """Snap each outer footprint boundary edge to the inner surface of real wall points."""
+    """Snap each outer footprint boundary edge to the inner surface of real wall points (spike-guarded)."""
     coords = np.asarray(list(orient(poly_uv, sign=1.0).exterior.coords)[:-1], dtype=np.float64)
     n = len(coords)
     if n < 3 or len(wall_uvz) < 200:
@@ -391,6 +457,7 @@ def _refine_footprint_edges_to_walls(
 
     normals = np.zeros((n, 2), dtype=np.float64)
     offsets = np.zeros(n, dtype=np.float64)
+    shifts = np.zeros(n, dtype=np.float64)
     edge_logs: list[dict[str, Any]] = []
 
     wall_uv = wall_uvz[:, :2]
@@ -410,10 +477,11 @@ def _refine_footprint_edges_to_walls(
         rel = wall_uv - p0[None, :]
         s_proj = rel @ t
         d_perp = rel @ out_n
-        mask = (s_proj >= -0.10) & (s_proj <= length + 0.10) & (np.abs(d_perp) <= search_band_m)
+        mask = (s_proj >= -0.08) & (s_proj <= length + 0.08) & (np.abs(d_perp) <= search_band_m)
         cnt = int(np.sum(mask))
         snapped = False
         c_new = c0
+        shift = 0.0
         if cnt >= min_support_pts:
             d_vals = d_perp[mask]
             d_lo, d_hi = float(d_vals.min()), float(d_vals.max())
@@ -426,28 +494,51 @@ def _refine_footprint_edges_to_walls(
                 shift = float(np.median(in_band)) if len(in_band) else peak_d
             else:
                 shift = float(np.median(d_vals))
+            # Guard against huge outward shift onto exterior doorway/alcove walls
+            shift = float(np.clip(shift, -0.22, 0.22))
             c_new = c0 + shift
             snapped = True
 
         normals[i] = out_n
         offsets[i] = c_new
+        shifts[i] = shift
         edge_logs.append({
             "edge_index": i,
             "length_m": round(length, 3),
             "wall_support_points": cnt,
             "snapped": snapped,
-            "shift_m": round(c_new - c0, 4),
+            "shift_m": round(shift, 4),
         })
+
+    from scipy.spatial import cKDTree
+
+    if support_cloud_uv is not None and len(support_cloud_uv) > 0:
+        stride = max(1, len(support_cloud_uv) // 250_000)
+        cloud_tree = cKDTree(support_cloud_uv[::stride])
+    else:
+        cloud_tree = None
 
     new_coords = coords.copy()
     for i in range(n):
         prev_i = (i - 1) % n
         a_mat = np.vstack([normals[prev_i], normals[i]])
         det = float(np.linalg.det(a_mat))
-        if abs(det) > 0.15:
+        if abs(det) >= 0.45:
+            # Crisp real corner (>= 27 deg): solve exact intersection with tight 0.24m cap
             pt = np.linalg.solve(a_mat, np.array([offsets[prev_i], offsets[i]], dtype=np.float64))
-            if np.linalg.norm(pt - coords[i]) <= 0.80:
-                new_coords[i] = pt
+            if float(np.linalg.norm(pt - coords[i])) > 0.24:
+                pt = coords[i] + 0.5 * (shifts[prev_i] * normals[prev_i] + shifts[i] * normals[i])
+        else:
+            # Nearly-collinear joint (< 27 deg): NEVER divide by small det (prevents outward vertex spikes!)
+            pt = coords[i] + 0.5 * (shifts[prev_i] * normals[prev_i] + shifts[i] * normals[i])
+
+        # Vertex-to-cloud fidelity guard: reject any move that pushes a vertex into empty space (> 16cm from cloud!)
+        if cloud_tree is not None:
+            d_old = float(cloud_tree.query(coords[i])[0])
+            d_new = float(cloud_tree.query(pt)[0])
+            if d_new > max(0.16, d_old + 0.04):
+                pt = coords[i]
+        new_coords[i] = pt
 
     refined = Polygon(new_coords).buffer(0)
     if isinstance(refined, MultiPolygon):
@@ -716,11 +807,17 @@ def analyze_floor_and_ceiling(
     closed = ndimage.binary_closing(grid, structure=struct, iterations=2)
     raw_poly = _raster_mask_to_polygon(closed, u0, v0, cell)
     ortho_poly = _snap_orthogonal_polygon(raw_poly)
+    ortho_poly = _merge_collinear_wall_edges(ortho_poly, wall_uvz)
 
-    snapped_poly, edge_logs = _refine_footprint_edges_to_walls(ortho_poly, wall_uvz)
+    support_cloud_uv = uvz[(work_labels == 1) | (work_labels == 2) | (work_labels == 13), :2]
+    snapped_poly, edge_logs = _refine_footprint_edges_to_walls(
+        ortho_poly, wall_uvz, support_cloud_uv=support_cloud_uv
+    )
     snapped_poly, squared_bevels = _square_spurious_corner_bevels(snapped_poly, wall_uvz)
     if squared_bevels > 0:
-        snapped_poly, edge_logs = _refine_footprint_edges_to_walls(snapped_poly, wall_uvz)
+        snapped_poly, edge_logs = _refine_footprint_edges_to_walls(
+            snapped_poly, wall_uvz, support_cloud_uv=support_cloud_uv
+        )
 
     # Filter any higher secondary ceiling that lies mostly OUTSIDE the snapped interior room footprint
     # (blocks outdoor rooftop/canopy overhangs while keeping genuine indoor stairwell/mezzanine ceilings!)
@@ -889,8 +986,9 @@ def build_floor_and_ceiling_parts(
             upper_slab_bands.append((g_clean, z_bot, z_top))
             sub_idx += 1
 
-    # 3. Primary ceiling slab spanning outer_shell_uv, subtracting any stairwell/upper-railing cutouts
-    #    or co-elevation upper floor slabs so a 1F ceiling NEVER seals a stairwell or pierces 2F railings (B16)!
+    # 3. Primary ceiling slab spanning outer_shell_uv, subtracting ONLY objects that genuinely PIERCE
+    #    through [zc_bot, zc_top] (e.g. stairwell opening, 2F railings, raised stairwell walls, 2F clerestory).
+    #    G12: NEVER subtract 1F columns or 1F interior walls that terminate below zc_bot (cz1 <= zc_bot + 0.015)!
     if fc.ceiling_z is not None:
         zc_bot = fc.ceiling_z
         zc_top = fc.ceiling_z + cfg.ceiling_thickness_m
@@ -898,11 +996,11 @@ def build_floor_and_ceiling_parts(
         rel_c_cuts = [
             cpoly.buffer(0.008)
             for cpoly, cz0, cz1 in cutouts
-            if cz0 <= zc_top + 0.05 and cz1 >= zc_bot - 0.05
+            if cz0 < zc_top - 0.015 and cz1 > zc_bot + 0.015
         ]
-        # Also subtract upper floor walkable zones whose top sits right at this ceiling level (1F ceiling == 2F floor)
+        # Also subtract upper floor walkable zones whose slab overlaps [zc_bot, zc_top] vertically
         for up_poly, ub, ut in upper_slab_bands:
-            if abs(ut - zc_bot) <= 0.25 or (ub <= zc_top + 0.05 and ut >= zc_bot - 0.05):
+            if (ub < zc_top - 0.015 and ut > zc_bot + 0.015) or abs(ut - zc_bot) <= 0.12:
                 rel_c_cuts.append(up_poly.buffer(0.008))
         # Also subtract higher-wing ceiling zones (e.g. a 2F stairwell roof above the 1F lobby ceiling!)
         for clv_hi in fc.ceiling_levels:
@@ -939,6 +1037,7 @@ def build_floor_and_ceiling_parts(
                         "z_bottom_local": round(zc_bot, 4),
                         "thickness_m": cfg.ceiling_thickness_m,
                         "outer_area_m2": round(float(g_clean.area), 3),
+                        "hole_count": len(g_clean.interiors),
                     },
                 )
             )

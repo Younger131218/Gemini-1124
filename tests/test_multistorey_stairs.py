@@ -325,3 +325,39 @@ def test_overhead_header_interior_wall_not_stretched_to_floor_and_stair_bounds(t
     iw = report["architecture"]["interior_walls"]["walls"]
     assert len(iw) == 1, iw
     assert (iw[0]["z_span"][0] - floor_z) >= 1.80, f"Overhead header stretched down into walkway: {iw[0]}"
+
+
+def test_single_storey_ceiling_never_punched_by_1f_columns_or_interior_walls(tmp_path: Path) -> None:
+    """Regression gate G12: 1F columns & 1F interior walls ending beneath ceiling_primary MUST leave 0 roof holes!"""
+    floor = _grid_xy(0.0, 8.0, 0.0, 6.0, z=0.0, step=0.10)
+    ceil = _grid_xy(0.0, 8.0, 0.0, 6.0, z=3.2, step=0.10)
+    walls = np.vstack([
+        _grid_wall_x(0.0, 8.0, 0.0, 0.0, 3.2),
+        _grid_wall_x(0.0, 8.0, 6.0, 0.0, 3.2),
+        _grid_wall_y(0.0, 0.0, 6.0, 0.0, 3.2),
+        _grid_wall_y(8.0, 0.0, 6.0, 0.0, 3.2),
+    ])
+    # Two full-height 1F columns reaching z=3.2 + one 1F interior partition wall
+    col1 = np.vstack([
+        _grid_wall_x(2.0, 2.5, 2.0, 0.0, 3.18, step=0.06),
+        _grid_wall_x(2.0, 2.5, 2.5, 0.0, 3.18, step=0.06),
+        _grid_wall_y(2.0, 2.0, 2.5, 0.0, 3.18, step=0.06),
+        _grid_wall_y(2.5, 2.0, 2.5, 0.0, 3.18, step=0.06),
+    ])
+    int_w = _grid_wall_x(4.5, 6.5, 3.0, 0.0, 3.18, step=0.06)
+    pts = np.vstack([floor, ceil, walls, col1, int_w])
+    cls = np.concatenate([
+        np.full(len(floor), 1),
+        np.full(len(ceil), 0),
+        np.full(len(walls), 2),
+        np.full(len(col1), 4),
+        np.full(len(int_w), 2),
+    ])
+    las_file = tmp_path / "synth_sealed_ceiling.las"
+    _write_las(las_file, pts, cls)
+    report = run_arch_pipeline(las_file, tmp_path / "out_sealed", render_preview=False)
+    assert report["status"] == "PASS", report
+    assert report["relation_audit"]["unexpected_penetration_count"] == 0
+    assert report["architecture"]["columns"]["emitted_count"] >= 1
+    assert report["invariants_audit"]["ceiling_primary_hole_count"] == 0, report["invariants_audit"]
+    assert report["invariants_audit"]["single_storey_ceiling_sealed_ok"] is True

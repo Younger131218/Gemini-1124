@@ -168,3 +168,35 @@ def test_wl_a2_recovers_ceiling_mislabeled_as_floor_and_preserves_real_2f_floor(
     idx_f2_start = len(floor1) + len(ceil0)
     idx_f2_end = idx_f2_start + len(fake_floor_patch)
     assert np.all(state2.work_labels[idx_f2_start:idx_f2_end] == 1), "Real 2F floor under 2F room must remain class 1"
+
+
+def test_wl_d_merges_stair_mid_landing_into_stairs_but_preserves_top_2f_floor() -> None:
+    # 1F floor at z=0.0, 2-flight stair rising 0 -> 1.5 -> 3.0,
+    # compact 2m x 2m mid-landing at z=1.5 labeled as class 1 (MUST merge 1 -> 13!),
+    # plus large 6m x 6m 2F room floor at z=3.0 labeled as class 1 (MUST stay class 1!)
+    floor1 = _grid_plane_xy(0, 10, 0, 10, z=0.0, step=0.12)
+    f1_steps = [
+        _grid_plane_xy(1.0 + i * 0.25, 1.25 + i * 0.25, 1.0, 2.5, z=(i + 1) * 0.18, step=0.06)
+        for i in range(8)
+    ]
+    mid_landing = _grid_plane_xy(3.0, 4.8, 1.0, 2.8, z=1.50, step=0.07)  # compact 3.24m2 landing in class 1!
+    f2_steps = [
+        _grid_plane_xy(3.0, 4.5, 2.8 + i * 0.25, 3.05 + i * 0.25, z=1.50 + (i + 1) * 0.18, step=0.06)
+        for i in range(8)
+    ]
+    real_2f_floor = _grid_plane_xy(0.0, 6.0, 4.8, 10.0, z=3.00, step=0.12)  # 31.2m2 real 2F room floor!
+
+    stairs_raw = np.vstack(f1_steps + f2_steps)
+    pts = np.vstack([floor1, stairs_raw, mid_landing, real_2f_floor])
+    raw = np.concatenate([
+        np.full(len(floor1), 1, dtype=np.uint8),
+        np.full(len(stairs_raw), 13, dtype=np.uint8),
+        np.full(len(mid_landing), 1, dtype=np.uint8),
+        np.full(len(real_2f_floor), 1, dtype=np.uint8),
+    ])
+    state = build_working_labels(_make_cloud(pts, raw), WorkingLabelConfig())
+    i_land0 = len(floor1) + len(stairs_raw)
+    i_land1 = i_land0 + len(mid_landing)
+    assert np.all(state.work_labels[i_land0:i_land1] == 13), "Mid-landing between flights must merge 1 -> 13"
+    assert any(a.rule_name == "WL-D_stair_landing_floor_to_stairs" for a in state.adjustments)
+    assert np.all(state.work_labels[i_land1:] == 1), "Real 2F room floor at top of stairs must remain class 1"

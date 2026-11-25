@@ -21,6 +21,7 @@ RULE_WL_A_CEILING_0_TO_11 = 1
 RULE_WL_B_ISOLATED_NOISE = 2
 RULE_WL_C1_FLUSH_COLUMN_TO_WALL = 3
 RULE_WL_C2_MIXED_DOMINANCE = 4
+RULE_WL_D_STAIR_LANDING_1_TO_13 = 5
 
 
 def _bbox_summary(pts: np.ndarray) -> tuple[list[float], list[float]]:
@@ -648,6 +649,81 @@ def resolve_mixed_component_dominance(
     }
 
 
+def _apply_wl_d_stair_landing_merge(
+    points: np.ndarray,
+    work_labels: np.ndarray,
+    rule_ids: np.ndarray,
+    adjustments: list[WorkingLabelAdjustment],
+    z_floor: float,
+) -> None:
+    """WL-D: Merge elevated compact horizontal floor patches sandwiched between stair flights into class 13.
+
+    AI segmenters frequently label flat turn landings between U/L-turn stair flights as class 1 (floor),
+    causing 30cm step discontinuities or red-floor vs orange-stair splits. Merging ONLY compact (<= 8 m^2),
+    flat, elevated clusters strictly inside the staircase Z-span and touching class 13 (< 0.35 m in 3D)
+    keeps real upper-storey room floors (large area or at the top of stairs, e.g. DCJS 2F) 100% untouched.
+    """
+    stair_idx = np.flatnonzero(work_labels == 13)
+    if len(stair_idx) < 1000:
+        return
+    stair_pts = points[stair_idx]
+    z_st_lo = float(np.percentile(stair_pts[:, 2], 2))
+    z_st_hi = float(np.percentile(stair_pts[:, 2], 98))
+    if z_st_hi - z_st_lo < 1.10:
+        return
+
+    elev_f_idx = np.flatnonzero((work_labels == 1) & (points[:, 2] > z_floor + 0.40))
+    if len(elev_f_idx) < 300:
+        return
+    elev_pts = points[elev_f_idx]
+
+    from scipy.spatial import cKDTree
+
+    st_tree = cKDTree(stair_pts)
+    comps = _voxel_connected_components_3d(elev_pts, voxel_size=0.15)
+    for comp in comps:
+        if len(comp) < 300:
+            continue
+        sub = elev_pts[comp]
+        z_med = float(np.median(sub[:, 2]))
+        z_span = float(np.percentile(sub[:, 2], 95) - np.percentile(sub[:, 2], 5))
+        if z_span > 0.38:
+            continue
+        # Must sit strictly BETWEEN stair flights (NOT the primary floor and NOT the top 2F room floor!)
+        if not (z_st_lo + 0.30 <= z_med <= z_st_hi - 0.25):
+            continue
+        vox_cells = len(np.unique(np.floor(sub[:, :2] / 0.10).astype(np.int64), axis=0))
+        area = float(vox_cells) * 0.01
+        if not (0.40 <= area <= 8.0):
+            continue
+        dists, _ = st_tree.query(sub, k=1)
+        near_cnt = int(np.sum(dists <= 0.35))
+        if near_cnt < 200:
+            continue
+
+        global_idx = elev_f_idx[comp]
+        work_labels[global_idx] = 13
+        rule_ids[global_idx] = RULE_WL_D_STAIR_LANDING_1_TO_13
+        mn, mx = _bbox_summary(sub)
+        adjustments.append(
+            WorkingLabelAdjustment(
+                rule_id=RULE_WL_D_STAIR_LANDING_1_TO_13,
+                rule_name="WL-D_stair_landing_floor_to_stairs",
+                raw_class=1,
+                work_class=13,
+                point_count=int(len(global_idx)),
+                bbox_min_local=mn,
+                bbox_max_local=mx,
+                evidence={
+                    "z_median_local": round(z_med, 4),
+                    "z_span_p5_p95_m": round(z_span, 4),
+                    "occupied_area_m2": round(area, 3),
+                    "near_stair_points_35cm": near_cnt,
+                },
+            )
+        )
+
+
 def build_working_labels(
     cloud: SceneCloud,
     cfg: WorkingLabelConfig | None = None,
@@ -665,6 +741,7 @@ def build_working_labels(
     _apply_wl_a_ceiling(cloud.points_local, raw, work, rule_ids, adjustments, z_floor, floor_area, wcfg)
     _apply_wl_b_isolated_noise(cloud.points_local, work, rule_ids, adjustments, z_floor, wcfg)
     _apply_wl_c1_wall_column_mix(cloud.points_local, work, rule_ids, adjustments, ambiguous, wcfg)
+    _apply_wl_d_stair_landing_merge(cloud.points_local, work, rule_ids, adjustments, z_floor)
 
     return WorkingLabelState(
         raw_labels=raw,
