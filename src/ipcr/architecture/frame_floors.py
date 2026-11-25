@@ -827,24 +827,56 @@ def build_floor_and_ceiling_parts(
             upper_slab_bands.append((g_clean, z_bot, z_top))
             sub_idx += 1
 
-    # 3. Primary roof ceiling slab spanning outer_shell_uv, flush atop exterior walls
+    # 3. Primary ceiling slab spanning outer_shell_uv, subtracting any stairwell/upper-railing cutouts
+    #    or co-elevation upper floor slabs so a 1F ceiling NEVER seals a stairwell or pierces 2F railings (B16)!
     if fc.ceiling_z is not None:
-        cv_uv, ct = extrude_polygon_solid(outer_shell_uv, fc.ceiling_z, fc.ceiling_z + cfg.ceiling_thickness_m)
-        parts.append(
-            MeshPart(
-                part_id="ceiling_primary",
-                class_id=11,
-                role="ceiling",
-                vertices=fc.frame.uvz_to_xyz(cv_uv),
-                triangles=ct,
-                evidence_kind="measured",
-                metadata={
-                    "z_bottom_local": round(fc.ceiling_z, 4),
-                    "thickness_m": cfg.ceiling_thickness_m,
-                    "outer_area_m2": round(float(outer_shell_uv.area), 3),
-                },
-            )
+        zc_bot = fc.ceiling_z
+        zc_top = fc.ceiling_z + cfg.ceiling_thickness_m
+        c_poly: Polygon | MultiPolygon = outer_shell_uv
+        rel_c_cuts = [
+            cpoly.buffer(0.008)
+            for cpoly, cz0, cz1 in cutouts
+            if cz0 <= zc_top + 0.05 and cz1 >= zc_bot - 0.05
+        ]
+        # Also subtract upper floor walkable zones whose top sits right at this ceiling level (1F ceiling == 2F floor)
+        for up_poly, ub, ut in upper_slab_bands:
+            if abs(ut - zc_bot) <= 0.25 or (ub <= zc_top + 0.05 and ut >= zc_bot - 0.05):
+                rel_c_cuts.append(up_poly.buffer(0.008))
+        if rel_c_cuts:
+            c_poly = c_poly.difference(unary_union(rel_c_cuts)).buffer(0)
+        geoms_c = (
+            list(c_poly.geoms)
+            if isinstance(c_poly, MultiPolygon)
+            else ([c_poly] if isinstance(c_poly, Polygon) else [])
         )
+        c_idx = 0
+        for g in geoms_c:
+            if g.is_empty or g.area < 0.50:
+                continue
+            g_clean = orient(g.buffer(0), sign=1.0)
+            if isinstance(g_clean, MultiPolygon):
+                g_clean = max(g_clean.geoms, key=lambda x: x.area)
+            try:
+                cv_uv, ct = extrude_polygon_solid(g_clean, zc_bot, zc_top)
+            except ValueError:
+                continue
+            pid = "ceiling_primary" if c_idx == 0 else f"ceiling_primary_{c_idx}"
+            parts.append(
+                MeshPart(
+                    part_id=pid,
+                    class_id=11,
+                    role="ceiling",
+                    vertices=fc.frame.uvz_to_xyz(cv_uv),
+                    triangles=ct,
+                    evidence_kind="measured",
+                    metadata={
+                        "z_bottom_local": round(zc_bot, 4),
+                        "thickness_m": cfg.ceiling_thickness_m,
+                        "outer_area_m2": round(float(g_clean.area), 3),
+                    },
+                )
+            )
+            c_idx += 1
 
     # 4. Secondary lower-wing ceiling slabs (strictly inside inner_uv, disjoint from primary ceiling & upper floors)
     for clv in fc.ceiling_levels:

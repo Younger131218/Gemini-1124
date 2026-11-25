@@ -241,7 +241,8 @@ def _fit_and_build_flight(
         if abs(z_hi - flv.z_top) <= 0.30:
             z_hi = flv.z_top - 0.004
     z_lo = max(z_lo, fc.floor_z + 0.004)
-    if fc.ceiling_z is not None:
+    # Only clamp z_hi to a ceiling that actually sits ABOVE this stair flight (never clamp 2F stairs to a lower 1F ceiling!)
+    if fc.ceiling_z is not None and len(fc.floor_levels) <= 1 and z_hi_raw <= fc.ceiling_z + 0.25:
         z_hi = min(z_hi, fc.ceiling_z - 0.05)
     if z_hi - z_lo < 0.40:
         return None
@@ -567,6 +568,8 @@ def build_stairs_and_railings(
             bal_count += 1
 
         placed_rail_bands.append((seg_uv_poly, z_min_post, max(zt_a, zt_b)))
+        # Register upper-level / stair railings as ceiling cutouts so no lower-storey ceiling ever slices through them!
+        stair_well_cutouts.append((seg_uv_poly.buffer(0.03), z_min_post - 0.02, max(zt_a, zt_b) + 0.05))
         beam_blocker_bands.append((seg_uv_poly.buffer(0.02), z_min_post, max(zt_a, zt_b) + 0.05))
         if is_sloped:
             stair_well_cutouts.append((seg_uv_poly.buffer(0.03), z_min_post - 0.05, max(zt_a, zt_b) + 0.05))
