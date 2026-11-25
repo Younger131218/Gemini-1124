@@ -180,3 +180,99 @@ def test_open_swing_door_and_wall_void_door_rules(tmp_path: Path) -> None:
     assert report["architecture"]["openings"]["door_count"] == 2, report["architecture"]["openings"]
     reasons = [r["reason"] for r in report["architecture"]["openings"]["rejected"]]
     assert "failed_b14_door_solid_wall_below" in reasons, report["architecture"]["openings"]
+
+
+def test_dual_angle_trapezoid_higher_stairwell_roof_and_u_turn_stairs(tmp_path: Path) -> None:
+    """Regression gate for G8 (mode-voting room frame + slanted wall preservation),
+    G9 (higher stairwell ceiling + raised stairwell walls + WL-A2), and G10 (U-turn multi-flight stairs).
+    """
+    # Build a 10m x 8m hall rotated by 30 deg with:
+    # - Main 1F ceiling at z=3.2 over y in [0, 5.0] (with central patch mislabeled as class 1!)
+    # - Higher 2F stairwell ceiling at z=5.2 over y in [5.0, 8.0], x in [4.0, 10.0]
+    # - Slanted west wall from (0.0, 0.0) to (1.8, 5.0) (~20 deg off-axis — must stay straight, NOT snap to orthogonal!)
+    # - 2-flight U-turn staircase inside the stairwell wing x in [4.5, 9.5], y in [4.8, 7.6]
+    #   Flight 1: x in [4.7, 6.2], y climbs 4.8 -> 6.8, z climbs 0.0 -> 1.8
+    #   Mid-landing: x in [4.7, 9.2], y in [6.8, 7.6], z = 1.8
+    #   Flight 2: x in [7.7, 9.2], y climbs 6.8 -> 4.8, z climbs 1.8 -> 3.6
+    def _in_trap(xy: np.ndarray) -> np.ndarray:
+        x, y = xy[:, 0], xy[:, 1]
+        # Slanted west edge: x >= 1.8 * (y / 5.0) for y <= 5, and x >= 4.0 for y > 5
+        west_x = np.where(y <= 5.0, 1.8 * (y / 5.0), 4.0)
+        return (x >= west_x) & (x <= 10.0) & (y >= 0.0) & (y <= 8.0)
+
+    raw_f = _grid_xy(0.0, 10.0, 0.0, 8.0, z=0.0, step=0.10)
+    floor = raw_f[_in_trap(raw_f)]
+
+    raw_c1 = _grid_xy(0.0, 10.0, 0.0, 5.0, z=3.2, step=0.10)
+    c1_all = raw_c1[_in_trap(raw_c1)]
+    c1_mislab_mask = (c1_all[:, 0] >= 4.0) & (c1_all[:, 0] <= 7.0) & (c1_all[:, 1] >= 1.2) & (c1_all[:, 1] <= 3.5)
+    c1_cls0 = c1_all[~c1_mislab_mask]
+    c1_cls1 = c1_all[c1_mislab_mask]  # AI mislabeled ceiling as floor!
+
+    c2_hi = _grid_xy(4.0, 10.0, 5.1, 8.0, z=5.2, step=0.10)
+
+    # Perimeter walls (1F height 3.2m on lobby, 5.2m around stairwell!)
+    w_south = _grid_wall_x(0.0, 10.0, 0.0, 0.0, 3.2)
+    w_east_1f = _grid_wall_y(10.0, 0.0, 5.0, 0.0, 3.2)
+    w_east_2f = _grid_wall_y(10.0, 5.0, 8.0, 0.0, 5.2)
+    w_north_2f = _grid_wall_x(4.0, 10.0, 8.0, 0.0, 5.2)
+    w_west_2f = _grid_wall_y(4.0, 5.0, 8.0, 0.0, 5.2)
+    w_step_n = _grid_wall_x(1.8, 4.0, 5.0, 0.0, 3.2)
+    # Slanted west lobby wall: (0, 0) -> (1.8, 5.0)
+    ts_w = np.linspace(0.0, 1.0, 75)
+    zs_w = np.arange(0.0, 3.2, 0.08)
+    gt, gz = np.meshgrid(ts_w, zs_w)
+    w_slant = np.column_stack([1.8 * gt.ravel(), 5.0 * gt.ravel(), gz.ravel()])
+    walls = np.vstack([w_south, w_east_1f, w_east_2f, w_north_2f, w_west_2f, w_step_n, w_slant])
+
+    # U-turn 2-flight staircase + landing
+    st_parts = []
+    for k in range(10):
+        yk = 4.6 + k * 0.22
+        zk = (k + 1) * 0.18
+        st_parts.append(_grid_xy(4.7, 6.2, yk, yk + 0.22, z=zk, step=0.06))
+    st_parts.append(_grid_xy(4.7, 9.2, 6.8, 7.6, z=1.80, step=0.06))
+    for k in range(10):
+        yk = 6.8 - (k + 1) * 0.22
+        zk = 1.80 + (k + 1) * 0.18
+        st_parts.append(_grid_xy(7.7, 9.2, yk, yk + 0.22, z=zk, step=0.06))
+    stairs = np.vstack(st_parts)
+
+    pts_local = np.vstack([floor, c1_cls0, c1_cls1, c2_hi, walls, stairs])
+    # Rotate entire scene by +30 deg to verify mode-voting principal frame lock!
+    ang = np.radians(30.0)
+    rot = np.array([[np.cos(ang), -np.sin(ang)], [np.sin(ang), np.cos(ang)]])
+    pts_rot = pts_local.copy()
+    pts_rot[:, :2] = pts_local[:, :2] @ rot.T
+
+    cls = np.concatenate([
+        np.full(len(floor), 1),
+        np.full(len(c1_cls0), 0),
+        np.full(len(c1_cls1), 1),
+        np.full(len(c2_hi), 0),
+        np.full(len(walls), 2),
+        np.full(len(stairs), 13),
+    ])
+
+    las_file = tmp_path / "synth_trapezoid_uturn.las"
+    _write_las(las_file, pts_rot, cls)
+    out_dir = tmp_path / "out_trap"
+    report = run_arch_pipeline(las_file, out_dir, render_preview=False)
+
+    assert report["status"] == "PASS", report["relation_audit"]
+    assert report["glb_validation"]["status"] == "PASS"
+    assert report["relation_audit"]["unexpected_penetration_count"] == 0
+
+    fc_rep = report["architecture"]["floor_ceiling"]
+    # Principal angle must lock onto the dominant 30-deg wall family (mod 90 within 3 deg), NOT average with slanted wall!
+    ang_mod = fc_rep["principal_angle_deg"] % 90.0
+    ang_err = min(abs(ang_mod - 30.0), 90.0 - abs(ang_mod - 30.0))
+    assert ang_err < 3.5, f"Mode-voting frame drifted: {fc_rep['principal_angle_deg']} deg"
+    # WL-A2 must keep floor_levels == 1 (no phantom 2F floor from mislabeled 1F ceiling!)
+    assert len(fc_rep["floor_levels"]) == 1, fc_rep["floor_levels"]
+    # Higher stairwell ceiling (+5.2m) must be detected alongside primary (+3.2m)
+    assert len(fc_rep["ceiling_levels"]) == 2, fc_rep["ceiling_levels"]
+    # U-turn staircase must decompose into >= 2 flights + landing
+    sr = report["architecture"]["stairs_railings"]
+    assert sr["emitted_stair_flights"] >= 2, sr
+    assert sr["emitted_stair_landings"] >= 1, sr

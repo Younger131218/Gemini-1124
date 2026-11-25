@@ -15,6 +15,7 @@ from ipcr.architecture.stairs_railings import build_stairs_and_railings
 from ipcr.architecture.walls_shell import (
     build_exterior_wall_parts,
     build_interior_wall_parts,
+    collect_raised_exterior_wall_cutouts,
     plan_exterior_wall_shell,
 )
 from ipcr.baseline import verify_frozen_baseline
@@ -92,7 +93,14 @@ def run_pipeline(
         fc, shell, int_wall_polys_uv, cloud.points_local, wl_state.work_labels, pcfg.architecture
     )
     stair_parts, stair_well_cutouts, stair_beam_blockers, stair_audit = build_stairs_and_railings(
-        fc, shell, int_wall_polys_uv, col_polys_uv, cloud.points_local, wl_state.work_labels, pcfg.architecture
+        fc,
+        shell,
+        int_wall_polys_uv,
+        col_polys_uv,
+        cloud.points_local,
+        wl_state.work_labels,
+        pcfg.architecture,
+        column_z_bands=col_cutouts,
     )
     beam_parts, beam_audit = build_beam_parts(
         fc,
@@ -105,7 +113,8 @@ def run_pipeline(
         extra_blocker_bands=stair_beam_blockers,
     )
 
-    upper_floor_cutouts = [*stair_well_cutouts, *col_cutouts, *int_wall_cutouts]
+    raised_wall_cutouts = collect_raised_exterior_wall_cutouts(fc, shell)
+    upper_floor_cutouts = [*stair_well_cutouts, *col_cutouts, *int_wall_cutouts, *raised_wall_cutouts]
     parts: list[MeshPart] = []
     parts.extend(
         build_floor_and_ceiling_parts(

@@ -71,50 +71,57 @@ def _inscribe_sw_rect(
     min_run_m: float = 0.75,
     min_width_m: float = 0.55,
 ) -> tuple[float, float, float, float] | None:
-    """Shrink any colliding side of a stair flight rectangle so it lies 100% inside allowed_xy."""
-    step = 0.025
-    for _ in range(80):
+    """Shrink any colliding side of a stair flight rectangle so it lies 100% inside allowed_xy.
+
+    Uses greedy outside-area reduction so angled/notched stairwell corners trim the minimal offending side
+    instead of oscillating or collapsing the flight.
+    """
+    step = 0.03
+    for _ in range(160):
         if s_hi - s_lo < min_run_m or w_hi - w_lo < min_width_m:
             return None
         rect = _sw_rect_poly(s_lo, s_hi, w_lo, w_hi, run_dir, lat_dir)
         if allowed_xy.contains(rect):
             return s_lo, s_hi, w_lo, w_hi
 
-        # Test 12 samples along each of the 4 sides to find which side(s) poke outside
-        ts = np.linspace(0.0, 1.0, 13)
-        sides_out = []
-        # s_lo side
-        pts_slo = [run_dir * s_lo + lat_dir * (w_lo + t * (w_hi - w_lo)) for t in ts]
-        out_slo = sum(0 if allowed_xy.contains(Point(p[0], p[1])) else 1 for p in pts_slo)
-        sides_out.append((out_slo, "s_lo"))
-        # s_hi side
-        pts_shi = [run_dir * s_hi + lat_dir * (w_lo + t * (w_hi - w_lo)) for t in ts]
-        out_shi = sum(0 if allowed_xy.contains(Point(p[0], p[1])) else 1 for p in pts_shi)
-        sides_out.append((out_shi, "s_hi"))
-        # w_lo side
-        pts_wlo = [run_dir * (s_lo + t * (s_hi - s_lo)) + lat_dir * w_lo for t in ts]
-        out_wlo = sum(0 if allowed_xy.contains(Point(p[0], p[1])) else 1 for p in pts_wlo)
-        sides_out.append((out_wlo, "w_lo"))
-        # w_hi side
-        pts_whi = [run_dir * (s_lo + t * (s_hi - s_lo)) + lat_dir * w_hi for t in ts]
-        out_whi = sum(0 if allowed_xy.contains(Point(p[0], p[1])) else 1 for p in pts_whi)
-        sides_out.append((out_whi, "w_hi"))
+        out_area = max(0.0, float(rect.area) - float(rect.intersection(allowed_xy).area))
+        if out_area <= 1e-5:
+            return s_lo, s_hi, w_lo, w_hi
 
-        sides_out.sort(reverse=True)
-        if sides_out[0][0] == 0:
-            # Interior obstacle (like a pillar inside the rectangle): shrink all sides slightly
-            w_lo += step
-            w_hi -= step
-            continue
-        worst = sides_out[0][1]
-        if worst == "s_lo":
-            s_lo += step
-        elif worst == "s_hi":
-            s_hi -= step
-        elif worst == "w_lo":
-            w_lo += step
+        # Try trimming each of the 4 sides and pick the move that removes the highest fraction of outside area
+        best_move = None
+        best_score = -1.0
+        candidates = [
+            (s_lo + step, s_hi, w_lo, w_hi),
+            (s_lo, s_hi - step, w_lo, w_hi),
+            (s_lo, s_hi, w_lo + step, w_hi),
+            (s_lo, s_hi, w_lo, w_hi - step),
+        ]
+        for cs0, cs1, cw0, cw1 in candidates:
+            if cs1 - cs0 < min_run_m or cw1 - cw0 < min_width_m:
+                continue
+            crect = _sw_rect_poly(cs0, cs1, cw0, cw1, run_dir, lat_dir)
+            c_in = float(crect.intersection(allowed_xy).area)
+            c_out = max(0.0, float(crect.area) - c_in)
+            removed_out = out_area - c_out
+            if removed_out > 1e-6:
+                lost_total = max(float(rect.area) - float(crect.area), 1e-6)
+                # Ratio of removed outside area to total removed area (1.0 = pure overhang trim!)
+                score = (removed_out / lost_total) + 0.15 * removed_out
+                if score > best_score:
+                    best_score = score
+                    best_move = (cs0, cs1, cw0, cw1)
+
+        if best_move is not None:
+            s_lo, s_hi, w_lo, w_hi = best_move
         else:
-            w_hi -= step
+            # Interior obstacle: gently trim the longer span
+            if (s_hi - s_lo) >= (w_hi - w_lo):
+                s_lo += step
+                s_hi -= step
+            else:
+                w_lo += step
+                w_hi -= step
     return None
 
 
@@ -189,11 +196,148 @@ def _build_stepped_flight_mesh(
     return v_xyz, tri
 
 
+def _estimate_flight_dir_and_corr(
+    sub_uvz: np.ndarray,
+    *,
+    snap_tol_deg: float = 8.0,
+) -> tuple[np.ndarray | None, float]:
+    """Estimate uphill run direction (unit 2D UV vector) and linear (s, z) correlation."""
+    if len(sub_uvz) < 200:
+        return None, -1.0
+    z = sub_uvz[:, 2]
+    zc = z - float(np.mean(z))
+    zz = float(np.dot(zc, zc))
+    if zz < 1e-6:
+        return None, -1.0
+    uc = sub_uvz[:, 0] - float(np.mean(sub_uvz[:, 0]))
+    vc = sub_uvz[:, 1] - float(np.mean(sub_uvz[:, 1]))
+    raw_dir = np.array([float(np.dot(uc, zc)) / zz, float(np.dot(vc, zc)) / zz], dtype=np.float64)
+    if float(np.linalg.norm(raw_dir)) < 0.15:
+        return None, -1.0
+    run_dir = _snap_dir_to_room_axis(raw_dir, tol_deg=snap_tol_deg)
+    s_vals = sub_uvz[:, :2] @ run_dir
+    if float(np.std(s_vals)) < 0.15 or float(np.std(z)) < 0.12:
+        return None, -1.0
+    corr = float(np.corrcoef(s_vals, z)[0, 1])
+    return run_dir, corr
+
+
+def _detect_turn_split(sub_uvz: np.ndarray, *, min_half_corr: float = 0.78) -> tuple[float, float] | None:
+    """Detect a turn (>=63 deg L-turn or U-turn) inside a stair component and return (z_turn_split, z_land_top).
+
+    Straight single flights have dot(dir_lo, dir_hi) ~ +1.0 and NEVER split.
+    L-turn (dot ~ 0.0) and U-turn (dot ~ -1.0) staircases split cleanly at the turn elevation.
+    """
+    if len(sub_uvz) < 1500:
+        return None
+    z = sub_uvz[:, 2]
+    z_span = float(np.percentile(z, 98) - np.percentile(z, 2))
+    if z_span < 1.15:
+        return None
+    _, g_corr = _estimate_flight_dir_and_corr(sub_uvz, snap_tol_deg=8.0)
+
+    best_score = -1.0
+    best_zt: float | None = None
+    for q in (25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75):
+        zt = float(np.percentile(z, q))
+        lo = sub_uvz[z < zt - 0.10]
+        hi = sub_uvz[z > zt + 0.10]
+        if len(lo) < 400 or len(hi) < 400:
+            continue
+        if float(np.percentile(lo[:, 2], 98) - np.percentile(lo[:, 2], 2)) < 0.50:
+            continue
+        if float(np.percentile(hi[:, 2], 98) - np.percentile(hi[:, 2], 2)) < 0.50:
+            continue
+        d_lo, c_lo = _estimate_flight_dir_and_corr(lo, snap_tol_deg=8.0)
+        d_hi, c_hi = _estimate_flight_dir_and_corr(hi, snap_tol_deg=8.0)
+        if d_lo is None or d_hi is None:
+            continue
+        if c_lo < min_half_corr or c_hi < min_half_corr:
+            continue
+        dot_lh = float(np.dot(d_lo, d_hi))
+        if dot_lh > 0.45:
+            continue
+        # Only compare against global corr for mild turns; true >=75-deg L/U-turns often have a
+        # spurious high lateral g_corr across the two flights!
+        if dot_lh > 0.15 and 0.5 * (c_lo + c_hi) <= max(g_corr, 0.0) + 0.03:
+            continue
+        score = c_lo + c_hi
+        if score > best_score:
+            best_score = score
+            best_zt = zt
+
+    if best_zt is None:
+        return None
+
+    # Refine z_land_top from the horizontal turn plateau near best_zt
+    mid_z = z[(z >= best_zt - 0.25) & (z <= best_zt + 0.25)]
+    z_land_top = best_zt
+    if len(mid_z) >= 80:
+        lo_m, hi_m = float(mid_z.min()), float(mid_z.max())
+        if hi_m - lo_m >= 0.05:
+            bins = np.arange(lo_m - 0.02, hi_m + 0.06, 0.04)
+            hist, edges = np.histogram(mid_z, bins=bins)
+            pk = int(np.argmax(hist))
+            zc = 0.5 * (edges[pk] + edges[pk + 1])
+            band = mid_z[np.abs(mid_z - zc) <= 0.06]
+            z_land_top = float(np.median(band)) if len(band) else zc
+        else:
+            z_land_top = float(np.median(mid_z))
+    return best_zt, z_land_top
+
+
+def _split_stair_turns_recursive(
+    sub_uvz: np.ndarray,
+    *,
+    z_lo_bound: float | None = None,
+    z_hi_bound: float | None = None,
+    depth: int = 0,
+    max_depth: int = 2,
+) -> list[tuple[np.ndarray, float | None, float | None]]:
+    """Recursively decompose a multi-turn stair component (L-turn, 2-flight U-turn, or 3-flight U-turn)
+    into an ordered sequence of straight flight segments [(pts, z_lo_override, z_hi_override), ...].
+    """
+    if depth >= max_depth:
+        return [(sub_uvz, z_lo_bound, z_hi_bound)]
+    min_corr = 0.78 if depth == 0 else 0.84
+    turn = _detect_turn_split(sub_uvz, min_half_corr=min_corr)
+    if turn is None:
+        return [(sub_uvz, z_lo_bound, z_hi_bound)]
+
+    z_turn_split, z_land_top = turn
+    lo_pts = sub_uvz[sub_uvz[:, 2] < z_land_top - 0.08]
+    if len(lo_pts) < 400:
+        lo_pts = sub_uvz[sub_uvz[:, 2] < z_turn_split - 0.06]
+    hi_pts = sub_uvz[sub_uvz[:, 2] > z_land_top + 0.08]
+    if len(hi_pts) < 400:
+        hi_pts = sub_uvz[sub_uvz[:, 2] > z_turn_split + 0.06]
+
+    left = _split_stair_turns_recursive(
+        lo_pts, z_lo_bound=z_lo_bound, z_hi_bound=z_land_top, depth=depth + 1, max_depth=max_depth
+    )
+    right = _split_stair_turns_recursive(
+        hi_pts, z_lo_bound=z_land_top + 0.004, z_hi_bound=z_hi_bound, depth=depth + 1, max_depth=max_depth
+    )
+    return left + right
+
+
+def _local_ceiling_above_poly(poly_uv: Polygon, fc: FloorCeilingResult) -> float | None:
+    """Return the local ceiling bottom elevation directly covering poly_uv (handles multi-height stairwells)."""
+    for clv in fc.ceiling_levels:
+        if (not clv.is_primary) and fc.ceiling_z is not None and clv.z_bottom > fc.ceiling_z + 0.65:
+            if clv.polygon_uv.buffer(0.25).intersects(poly_uv):
+                return clv.z_bottom
+    return fc.ceiling_z
+
+
 def _fit_and_build_flight(
     sub_uvz: np.ndarray,
     fc: FloorCeilingResult,
     allowed_xy: Polygon | MultiPolygon,
     flight_idx: int,
+    *,
+    z_lo_override: float | None = None,
+    z_hi_override: float | None = None,
 ) -> tuple[MeshPart, _FlightGeom] | None:
     """Fit a single straight stepped flight to sub_uvz and return watertight MeshPart + geometry."""
     if len(sub_uvz) < 400:
@@ -203,47 +347,31 @@ def _fit_and_build_flight(
     if z_hi_raw - z_lo_raw < 0.45:
         return None
 
-    # Regression of horizontal (u, v) vs z gives exact uphill run direction
-    zc = z - float(np.mean(z))
-    zz = float(np.dot(zc, zc))
-    if zz < 1e-6:
+    run_dir, corr = _estimate_flight_dir_and_corr(sub_uvz, snap_tol_deg=8.0)
+    if run_dir is None or corr < 0.55:
         return None
-    uc = sub_uvz[:, 0] - float(np.mean(sub_uvz[:, 0]))
-    vc = sub_uvz[:, 1] - float(np.mean(sub_uvz[:, 1]))
-    raw_dir = np.array([float(np.dot(uc, zc)) / zz, float(np.dot(vc, zc)) / zz], dtype=np.float64)
-    if float(np.linalg.norm(raw_dir)) < 0.15:
-        return None
-
-    run_dir = _snap_dir_to_room_axis(raw_dir, tol_deg=18.0)
     lat_dir = np.array([-run_dir[1], run_dir[0]], dtype=np.float64)
 
     s_vals = sub_uvz[:, :2] @ run_dir
     w_vals = sub_uvz[:, :2] @ lat_dir
 
-    # Verify monotonicity along run_dir
-    s_std = float(np.std(s_vals))
-    z_std = float(np.std(z))
-    if s_std < 0.15 or z_std < 0.12:
-        return None
-    corr = float(np.corrcoef(s_vals, z)[0, 1])
-    if corr < 0.55:
-        return None
-
     s_lo, s_hi = float(np.percentile(s_vals, 2)), float(np.percentile(s_vals, 98))
     w_lo, w_hi = float(np.percentile(w_vals, 3)), float(np.percentile(w_vals, 97))
 
     # Snap z_lo / z_hi to detected floor levels when close (leaving 4mm vertical clearance!)
-    z_lo = z_lo_raw
-    z_hi = z_hi_raw
+    z_lo = z_lo_override if z_lo_override is not None else z_lo_raw
+    z_hi = z_hi_override if z_hi_override is not None else z_hi_raw
     for flv in fc.floor_levels:
-        if abs(z_lo - flv.z_top) <= 0.30:
+        if z_lo_override is None and abs(z_lo - flv.z_top) <= 0.30:
             z_lo = flv.z_top + 0.004
-        if abs(z_hi - flv.z_top) <= 0.30:
+        if z_hi_override is None and abs(z_hi - flv.z_top) <= 0.30:
             z_hi = flv.z_top - 0.004
     z_lo = max(z_lo, fc.floor_z + 0.004)
-    # Only clamp z_hi to a ceiling that actually sits ABOVE this stair flight (never clamp 2F stairs to a lower 1F ceiling!)
-    if fc.ceiling_z is not None and len(fc.floor_levels) <= 1 and z_hi_raw <= fc.ceiling_z + 0.25:
-        z_hi = min(z_hi, fc.ceiling_z - 0.05)
+
+    raw_poly = _sw_rect_poly(s_lo, s_hi, w_lo, w_hi, run_dir, lat_dir)
+    local_ceil = _local_ceiling_above_poly(raw_poly, fc)
+    if local_ceil is not None and z_hi_raw <= local_ceil + 0.25:
+        z_hi = min(z_hi, local_ceil - 0.05)
     if z_hi - z_lo < 0.40:
         return None
 
@@ -294,6 +422,82 @@ def _fit_and_build_flight(
     return part, geom
 
 
+def _build_stair_landing(
+    land_pts: np.ndarray,
+    fl1: _FlightGeom,
+    fl2: _FlightGeom,
+    z_land_top: float,
+    fc: FloorCeilingResult,
+    allowed_xy: Polygon | MultiPolygon,
+    landing_idx: int,
+) -> tuple[MeshPart, Polygon, float, float] | None:
+    """Build a closed watertight horizontal mid-landing connecting fl1 and fl2 with 6mm clearance."""
+    if len(land_pts) < 120:
+        return None
+    r_dir = fl1.run_dir
+    l_dir = fl1.lat_dir
+    s_l = land_pts[:, :2] @ r_dir
+    w_l = land_pts[:, :2] @ l_dir
+    s_lo_raw = float(np.percentile(s_l, 2))
+    s_hi_raw = float(np.percentile(s_l, 98))
+    w_lo_raw = float(np.percentile(w_l, 2))
+    w_hi_raw = float(np.percentile(w_l, 98))
+
+    # Bridge across the combined lateral span of fl1 and fl2 at the turn end of fl1
+    fl2_corners = np.asarray(fl2.poly_uv.exterior.coords, dtype=np.float64)[:, :2]
+    fl2_w = fl2_corners @ l_dir
+    fl2_s = fl2_corners @ r_dir
+    w_lo = min(w_lo_raw, fl1.w_lo, float(fl2_w.min()))
+    w_hi = max(w_hi_raw, fl1.w_hi, float(fl2_w.max()))
+    # Start landing right at the top of fl1 (or measured landing start) and extend to back of landing
+    s_lo = min(s_lo_raw, fl1.s_hi - 0.05)
+    s_hi = max(s_hi_raw, fl1.s_hi + 0.65, float(fl2_s.max()) if float(np.dot(fl1.run_dir, fl2.run_dir)) < -0.5 else s_hi_raw)
+    if s_hi - s_lo < 0.45 or w_hi - w_lo < 0.65:
+        return None
+
+    rect = _sw_rect_poly(s_lo, s_hi, w_lo, w_hi, r_dir, l_dir)
+    clipped = rect.intersection(allowed_xy)
+    clipped = clipped.difference(unary_union([fl1.poly_uv.buffer(0.006), fl2.poly_uv.buffer(0.006)])).buffer(0)
+    geoms = (
+        list(clipped.geoms)
+        if isinstance(clipped, MultiPolygon)
+        else ([clipped] if isinstance(clipped, Polygon) else [])
+    )
+    valid = [g for g in geoms if (not g.is_empty) and g.area >= 0.35]
+    if not valid:
+        return None
+    poly = orient(max(valid, key=lambda g: g.area).buffer(0), sign=1.0)
+    if isinstance(poly, MultiPolygon):
+        poly = max(poly.geoms, key=lambda g: g.area)
+
+    thickness = 0.18
+    z_bot = max(fc.floor_z + 0.004, z_land_top - thickness)
+    z_top = z_land_top
+    if z_top - z_bot < 0.08:
+        return None
+    try:
+        v_uv, tri = extrude_polygon_solid(poly, z_bot, z_top)
+    except ValueError:
+        return None
+
+    pid = f"stair_landing_{landing_idx:02d}"
+    part = MeshPart(
+        part_id=pid,
+        class_id=13,
+        role="stair_landing",
+        vertices=fc.frame.uvz_to_xyz(v_uv),
+        triangles=tri,
+        evidence_kind="measured",
+        metadata={
+            "point_count": int(len(land_pts)),
+            "area_m2": round(float(poly.area), 3),
+            "z_span": [round(z_bot, 4), round(z_top, 4)],
+            "connects": [fl1.part_id, fl2.part_id],
+        },
+    )
+    return part, poly, z_bot, z_top
+
+
 def build_stairs_and_railings(
     fc: FloorCeilingResult,
     shell: ExteriorShellPlan,
@@ -302,6 +506,8 @@ def build_stairs_and_railings(
     points_local: np.ndarray,
     work_labels: np.ndarray,
     cfg: ArchitectureConfig,
+    *,
+    column_z_bands: list[tuple[Polygon, float, float]] | None = None,
 ) -> tuple[list[MeshPart], list[tuple[Polygon, float, float]], list[tuple[Polygon, float, float]], dict[str, Any]]:
     """Build watertight stepped stairs (cls 13) + open handrail/baluster railings (cls 14) per B16.
 
@@ -325,20 +531,57 @@ def build_stairs_and_railings(
             "note": "No qualifying stair or railing evidence in scene (any tiny floating specks were quarantined in WL-B).",
         }
 
-    # Base horizontal clearance domain inside room, away from walls & columns
-    allowed_xy = shell.inner_uv.buffer(-0.008)
+    # Base horizontal clearance domain inside room, away from walls & overlapping columns
+    # (Z-aware for columns: a short under-stairs support post ending below a flight's soffit does NOT block it!)
+    allowed_wall_xy = shell.inner_uv.buffer(-0.008)
+    if interior_wall_polys_uv:
+        allowed_wall_xy = allowed_wall_xy.difference(
+            unary_union([p.buffer(0.010) for p in interior_wall_polys_uv])
+        ).buffer(0)
+
+    def _allowed_xy_for_flight(sub_pts: np.ndarray, z_lo_hint: float | None, z_hi_hint: float | None) -> Polygon | MultiPolygon:
+        dom = allowed_wall_xy
+        if column_z_bands:
+            d_est, _ = _estimate_flight_dir_and_corr(sub_pts, snap_tol_deg=8.0)
+            z0 = z_lo_hint if z_lo_hint is not None else float(np.percentile(sub_pts[:, 2], 2))
+            z1 = z_hi_hint if z_hi_hint is not None else float(np.percentile(sub_pts[:, 2], 98))
+            blocking_cols: list[Polygon] = []
+            for cpoly, cz0, cz1 in column_z_bands:
+                if cz1 < z0 - 0.05 or cz0 > z1 + 0.05:
+                    continue
+                # If we know flight slope, check if the column sits strictly beneath the flight soffit at the column XY!
+                if d_est is not None:
+                    s_pts = sub_pts[:, :2] @ d_est
+                    s_lo_p, s_hi_p = float(np.percentile(s_pts, 2)), float(np.percentile(s_pts, 98))
+                    c_xy = np.asarray(cpoly.exterior.coords, dtype=np.float64)[:, :2]
+                    s_c_min = float((c_xy @ d_est).min())
+                    if s_hi_p > s_lo_p + 0.20:
+                        frac = np.clip((s_c_min - s_lo_p) / (s_hi_p - s_lo_p), 0.0, 1.0)
+                        soffit_z_at_col = z0 + frac * (z1 - z0) - 0.28
+                        if cz1 <= soffit_z_at_col - 0.03:
+                            continue
+                blocking_cols.append(cpoly.buffer(0.010))
+            if blocking_cols:
+                dom = dom.difference(unary_union(blocking_cols)).buffer(0)
+        elif column_polys_uv:
+            dom = dom.difference(unary_union([p.buffer(0.010) for p in column_polys_uv])).buffer(0)
+        return dom
+
+    allowed_xy = allowed_wall_xy
     static_blockers = [*interior_wall_polys_uv, *column_polys_uv]
-    if static_blockers:
-        allowed_xy = allowed_xy.difference(unary_union([p.buffer(0.010) for p in static_blockers])).buffer(0)
+    if column_polys_uv:
+        allowed_xy = allowed_xy.difference(unary_union([p.buffer(0.010) for p in column_polys_uv])).buffer(0)
 
     parts: list[MeshPart] = []
     flights: list[_FlightGeom] = []
+    landings: list[tuple[Polygon, float, float]] = []
     stair_well_cutouts: list[tuple[Polygon, float, float]] = []
     beam_blocker_bands: list[tuple[Polygon, float, float]] = []
     flight_logs: list[dict[str, Any]] = []
+    landing_logs: list[dict[str, Any]] = []
     railing_logs: list[dict[str, Any]] = []
 
-    # 1. Build stepped stair flights (class 13)
+    # 1. Build stepped stair flights + U/L-turn mid-landings (class 13)
     placed_flight_union: Polygon | MultiPolygon | None = None
     if len(stair_pts) >= 500:
         comps = _voxel_connected_components_3d(stair_pts, voxel_size=0.22)
@@ -346,12 +589,80 @@ def build_stairs_and_railings(
             if len(comp) < 500:
                 continue
             sub = stair_pts[comp]
+
+            # Recursively decompose any L-turn, 2-flight U-turn, or 3-flight U-turn staircase!
+            segments = _split_stair_turns_recursive(sub, max_depth=2)
+            if len(segments) > 1:
+                comp_flights: list[_FlightGeom] = []
+                for seg_pts, z_lo_ov, z_hi_ov in segments:
+                    seg_clean = seg_pts
+                    # For direct 180-deg U-turn pairs, trim lateral bleed from the preceding flight
+                    if comp_flights and len(seg_pts) >= 400:
+                        prev_fl = comp_flights[-1]
+                        d_cur, _ = _estimate_flight_dir_and_corr(seg_pts, snap_tol_deg=8.0)
+                        if d_cur is not None and float(np.dot(prev_fl.run_dir, d_cur)) < -0.50:
+                            w_cur = seg_pts[:, :2] @ prev_fl.lat_dir
+                            n_above = int(np.sum(w_cur > prev_fl.w_hi + 0.05))
+                            n_below = int(np.sum(w_cur < prev_fl.w_lo - 0.05))
+                            if n_above >= max(400, n_below):
+                                seg_clean = seg_pts[w_cur > prev_fl.w_hi + 0.05]
+                            elif n_below >= 400:
+                                seg_clean = seg_pts[w_cur < prev_fl.w_lo - 0.05]
+
+                    cur_allowed_s = _allowed_xy_for_flight(seg_clean, z_lo_ov, z_hi_ov)
+                    if placed_flight_union is not None and not placed_flight_union.is_empty:
+                        cur_allowed_s = cur_allowed_s.difference(placed_flight_union.buffer(0.015)).buffer(0)
+                    fres = _fit_and_build_flight(
+                        seg_clean,
+                        fc,
+                        cur_allowed_s,
+                        len(flights),
+                        z_lo_override=z_lo_ov,
+                        z_hi_override=z_hi_ov,
+                    )
+                    if fres is not None:
+                        fpart_s, fgeom_s = fres
+                        parts.append(fpart_s)
+                        flights.append(fgeom_s)
+                        comp_flights.append(fgeom_s)
+                        placed_flight_union = (
+                            fgeom_s.poly_uv
+                            if placed_flight_union is None
+                            else unary_union([placed_flight_union, fgeom_s.poly_uv])
+                        )
+                        stair_well_cutouts.append((fgeom_s.poly_uv.buffer(0.04), fgeom_s.z_lo - 0.05, fgeom_s.z_hi + 0.15))
+                        beam_blocker_bands.append((fgeom_s.poly_uv.buffer(0.03), fgeom_s.z_lo - 0.05, fgeom_s.z_hi + 0.15))
+                        flight_logs.append(fpart_s.metadata | {"part_id": fpart_s.part_id})
+
+                # Connect each consecutive flight pair with a crisp horizontal turn landing when evidence exists
+                for k in range(len(comp_flights) - 1):
+                    fl_a, fl_b = comp_flights[k], comp_flights[k + 1]
+                    z_turn_k = 0.5 * (fl_a.z_hi + fl_b.z_lo)
+                    land_pts_k = sub[(sub[:, 2] >= z_turn_k - 0.25) & (sub[:, 2] <= z_turn_k + 0.18)]
+                    cur_allowed_l = allowed_xy
+                    if placed_flight_union is not None and not placed_flight_union.is_empty:
+                        cur_allowed_l = cur_allowed_l.difference(placed_flight_union.buffer(0.006)).buffer(0)
+                    lres = _build_stair_landing(land_pts_k, fl_a, fl_b, fl_a.z_hi, fc, cur_allowed_l, len(landings))
+                    if lres is not None:
+                        lpart, lpoly, lz0, lz1 = lres
+                        parts.append(lpart)
+                        landings.append((lpoly, lz0, lz1))
+                        placed_flight_union = (
+                            lpoly if placed_flight_union is None else unary_union([placed_flight_union, lpoly])
+                        )
+                        stair_well_cutouts.append((lpoly.buffer(0.04), lz0 - 0.05, lz1 + 0.15))
+                        beam_blocker_bands.append((lpoly.buffer(0.03), lz0 - 0.05, lz1 + 0.15))
+                        landing_logs.append(lpart.metadata | {"part_id": lpart.part_id})
+
+                if comp_flights:
+                    continue
+
             cur_allowed = allowed_xy
             if placed_flight_union is not None and not placed_flight_union.is_empty:
                 cur_allowed = cur_allowed.difference(placed_flight_union.buffer(0.015)).buffer(0)
             res = _fit_and_build_flight(sub, fc, cur_allowed, len(flights))
             if res is None:
-                # Could be a 2-flight L/U turn: try splitting into lower & upper half-flights at median Z
+                # Fallback split at median Z
                 z_med = float(np.median(sub[:, 2]))
                 for half in (sub[sub[:, 2] <= z_med], sub[sub[:, 2] > z_med]):
                     cur_allowed = allowed_xy
@@ -524,6 +835,14 @@ def build_stairs_and_railings(
                     max_step_z = max(fl.step_top_z_at(float(c[0]), float(c[1])) for c in b_corners)
                     zb = max(zb, max_step_z + 0.008)
 
+            for lpoly, lz0, lz1 in landings:
+                if lpoly.buffer(0.015).intersects(b_poly):
+                    if zb < lz1 + 0.006 and hr_bot_local > lz0 - 0.006:
+                        if hr_bot_local - lz1 > 0.20:
+                            zb = max(zb, lz1 + 0.008)
+                        else:
+                            hr_bot_local = min(hr_bot_local, lz0 - 0.006)
+
             for flv in fc.floor_levels:
                 if flv.is_primary:
                     continue
@@ -588,17 +907,20 @@ def build_stairs_and_railings(
         for fl in flights:
             s_r = rail_pts[:, :2] @ fl.run_dir
             w_r = rail_pts[:, :2] @ fl.lat_dir
+            pitch_slope = (fl.z_hi - fl.z_lo) / max(fl.s_hi - fl.s_lo, 1e-6)
+            pitch_z_all = fl.z_lo + np.clip(s_r - fl.s_lo, -0.45, (fl.s_hi - fl.s_lo) + 0.45) * pitch_slope
             near_fl = (
                 (~consumed_rail_mask)
                 & (s_r >= fl.s_lo - 0.45)
                 & (s_r <= fl.s_hi + 0.45)
                 & (w_r >= fl.w_lo - 0.40)
                 & (w_r <= fl.w_hi + 0.40)
+                & (rail_pts[:, 2] >= pitch_z_all - 0.25)
+                & (rail_pts[:, 2] <= pitch_z_all + 1.55)
             )
             if int(np.sum(near_fl)) < 250:
                 continue
             w_center = 0.5 * (fl.w_lo + fl.w_hi)
-            pitch_slope = (fl.z_hi - fl.z_lo) / max(fl.s_hi - fl.s_lo, 1e-6)
 
             for side_idx, side_mask in (
                 (0, near_fl & (w_r <= w_center)),
@@ -628,15 +950,23 @@ def build_stairs_and_railings(
                 if abs(w_meas - w_target) > 0.12:
                     w_rail = w_target
 
-                # Measure constant handrail height above the flight pitch line (using 90th percentile in 0.5m bins)
+                # Measure constant handrail height above the flight pitch line (using 88th percentile)
                 pitch_z_pts = fl.z_lo + (sub_s - fl.s_lo) * pitch_slope
                 dz_above = sub_z - pitch_z_pts
                 h_rail = float(np.clip(np.percentile(dz_above, 88), 0.78, 1.12))
 
-                # Clip centerline inside room shell minus walls/columns
+                # Clip centerline inside room shell minus walls/columns and existing overlapping rails
                 p_start = fl.run_dir * s_lo_r + fl.lat_dir * w_rail
                 p_end = fl.run_dir * s_hi_r + fl.lat_dir * w_rail
-                line = LineString([p_start, p_end]).intersection(rail_allowed_base)
+                cur_fl_allowed = rail_allowed_base
+                ov_r = [
+                    p.buffer(0.045)
+                    for p, zb, zt in placed_rail_bands
+                    if zb <= fl.z_hi + h_rail + 0.05 and zt >= fl.z_lo - 0.05
+                ]
+                if ov_r:
+                    cur_fl_allowed = cur_fl_allowed.difference(unary_union(ov_r)).buffer(0)
+                line = LineString([p_start, p_end]).intersection(cur_fl_allowed)
                 segs = (
                     list(line.geoms)
                     if isinstance(line, MultiLineString)
@@ -654,9 +984,18 @@ def build_stairs_and_railings(
                 sa, sb = min(sa_raw, sb_raw) + 0.02, max(sa_raw, sb_raw) - 0.02
                 zt_a = fl.z_lo + (sa - fl.s_lo) * pitch_slope + h_rail
                 zt_b = fl.z_lo + (sb - fl.s_lo) * pitch_slope + h_rail
-                if fc.ceiling_z is not None:
-                    zt_a = min(zt_a, fc.ceiling_z - 0.06)
-                    zt_b = min(zt_b, fc.ceiling_z - 0.06)
+                # Never extrapolate handrail higher than measured railing points + 0.20m (prevents phantom overhang!)
+                max_meas_rail_z = float(np.percentile(sub_z, 98)) + 0.20
+                if zt_b > max_meas_rail_z and pitch_slope > 0.15:
+                    s_cap = fl.s_lo + (max_meas_rail_z - h_rail - fl.z_lo) / pitch_slope
+                    sb = min(sb, s_cap)
+                    if sb - sa < 0.65:
+                        continue
+                    zt_b = fl.z_lo + (sb - fl.s_lo) * pitch_slope + h_rail
+                local_ceil = _local_ceiling_above_poly(fl.poly_uv, fc)
+                if local_ceil is not None and fl.z_hi <= local_ceil + 0.10:
+                    zt_a = min(zt_a, local_ceil - 0.06)
+                    zt_b = min(zt_b, local_ceil - 0.06)
 
                 _emit_railing_run(
                     fl.run_dir,
@@ -737,9 +1076,11 @@ def build_stairs_and_railings(
         "stair_points_after_working_labels": int(len(stair_pts)),
         "railing_points_after_working_labels": int(len(rail_pts)),
         "emitted_stair_flights": emitted_stairs,
+        "emitted_stair_landings": len(landings),
         "emitted_railing_groups": rail_group_idx,
         "emitted_railing_parts": emitted_rails,
         "flights": flight_logs,
+        "landings": landing_logs,
         "railings": railing_logs,
     }
 

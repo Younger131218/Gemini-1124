@@ -135,3 +135,36 @@ def test_wl_c2_dominance_resolves_q04_bleed_and_preserves_ambiguous_mix() -> Non
     amb = np.concatenate([np.full(600, 8, dtype=np.uint8), np.full(400, 9, dtype=np.uint8)])
     r_amb = resolve_mixed_component_dominance(amb, dominance_ratio=0.90)
     assert r_amb["decision"] == "ambiguous_keep"
+
+
+def test_wl_a2_recovers_ceiling_mislabeled_as_floor_and_preserves_real_2f_floor() -> None:
+    # Case 1 (G9): 1F floor at z=0, ceiling at z=3.2 where center patch is mislabeled as class 1 (nothing above it!)
+    floor1 = _grid_plane_xy(0, 8, 0, 8, z=0.0, step=0.12)
+    ceil_outer = _grid_plane_xy(0, 8, 0, 8, z=3.2, step=0.12)
+    in_center = (ceil_outer[:, 0] >= 2.0) & (ceil_outer[:, 0] <= 6.0) & (ceil_outer[:, 1] >= 2.0) & (ceil_outer[:, 1] <= 6.0)
+    ceil0 = ceil_outer[~in_center]
+    fake_floor_patch = ceil_outer[in_center]
+    pts = np.vstack([floor1, ceil0, fake_floor_patch])
+    raw = np.concatenate([
+        np.full(len(floor1), 1, dtype=np.uint8),
+        np.full(len(ceil0), 0, dtype=np.uint8),
+        np.full(len(fake_floor_patch), 1, dtype=np.uint8),
+    ])
+    state = build_working_labels(_make_cloud(pts, raw), WorkingLabelConfig())
+    idx_patch = len(floor1) + len(ceil0)
+    assert np.all(state.work_labels[idx_patch:] == 11), "Mislabeled ceiling patch in class 1 must be promoted to 11"
+    assert any(a.rule_name == "WL-A2_ceiling_mislabeled_as_floor" for a in state.adjustments)
+
+    # Case 2 (Negative): Real 2F floor at z=3.2 WITH a 2F ceiling at z=6.2 directly above it MUST stay class 1!
+    ceil2 = _grid_plane_xy(2.0, 6.0, 2.0, 6.0, z=6.2, step=0.10)
+    pts2 = np.vstack([floor1, ceil0, fake_floor_patch, ceil2])
+    raw2 = np.concatenate([
+        np.full(len(floor1), 1, dtype=np.uint8),
+        np.full(len(ceil0), 0, dtype=np.uint8),
+        np.full(len(fake_floor_patch), 1, dtype=np.uint8),
+        np.full(len(ceil2), 0, dtype=np.uint8),
+    ])
+    state2 = build_working_labels(_make_cloud(pts2, raw2), WorkingLabelConfig())
+    idx_f2_start = len(floor1) + len(ceil0)
+    idx_f2_end = idx_f2_start + len(fake_floor_patch)
+    assert np.all(state2.work_labels[idx_f2_start:idx_f2_end] == 1), "Real 2F floor under 2F room must remain class 1"

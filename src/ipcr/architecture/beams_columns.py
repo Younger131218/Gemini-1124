@@ -25,11 +25,22 @@ def _lowest_overhead_slab_bottom(
     cfg: ArchitectureConfig,
     fallback_top: float,
 ) -> float:
-    """Find the lowest overhead slab bottom (upper floor bottom or ceiling bottom) above poly_uv."""
+    """Find the lowest overhead slab bottom (upper floor bottom or local ceiling bottom) above poly_uv."""
     candidates: list[float] = []
-    if fc.ceiling_z is not None and fc.ceiling_z > z_ref_bot + 0.15:
+    in_higher_ceiling_wing = False
+    for clv in fc.ceiling_levels:
+        if (not clv.is_primary) and fc.ceiling_z is not None and clv.z_bottom > fc.ceiling_z + 0.65:
+            if clv.polygon_uv.buffer(0.15).intersects(poly_uv):
+                inter = clv.polygon_uv.buffer(0.15).intersection(poly_uv)
+                if inter.area >= min(poly_uv.area * 0.25, 0.15):
+                    in_higher_ceiling_wing = True
+                    if clv.z_bottom > z_ref_bot + 0.15:
+                        candidates.append(clv.z_bottom)
+    if (not in_higher_ceiling_wing) and fc.ceiling_z is not None and fc.ceiling_z > z_ref_bot + 0.15:
         candidates.append(fc.ceiling_z)
     for clv in fc.ceiling_levels:
+        if clv.is_primary:
+            continue
         if clv.z_bottom > z_ref_bot + 0.15 and clv.polygon_uv.intersects(poly_uv):
             inter = clv.polygon_uv.intersection(poly_uv)
             if inter.area >= min(poly_uv.area * 0.25, 0.15):
@@ -133,16 +144,23 @@ def build_column_parts(
         base_z = _supporting_floor_top(clipped, z_lo, fc)
         col_z_min = base_z + 0.002
 
+        # Determine local ceiling limit (handles columns rising inside a higher stairwell/mezzanine roof)
+        local_ceil_top = z_top_limit
+        for clv in fc.ceiling_levels:
+            if (not clv.is_primary) and clv.z_bottom > local_ceil_top + 0.45:
+                if clv.polygon_uv.buffer(0.20).intersects(clipped) and z_hi > local_ceil_top + 0.20:
+                    local_ceil_top = clv.z_bottom
+
         # Determine local overhead slab (upper mezzanine or lower wing ceiling)
-        local_overhead = _lowest_overhead_slab_bottom(clipped, col_z_min, fc, cfg, z_top_limit)
+        local_overhead = _lowest_overhead_slab_bottom(clipped, col_z_min, fc, cfg, local_ceil_top)
         # Check if the column genuinely rises through the local overhead slab (e.g. full-height column)
         frac_above_local = float(np.mean(sub[:, 2] > local_overhead + cfg.floor_thickness_m + 0.25))
-        if local_overhead < z_top_limit - 0.30 and frac_above_local < 0.08:
+        if local_overhead < local_ceil_top - 0.30 and frac_above_local < 0.08:
             # Lower-storey column supporting the mezzanine/lower ceiling: cap cleanly beneath it!
             col_z_max = local_overhead - 0.002 if (local_overhead - z_hi) <= 0.65 else min(z_hi, local_overhead - 0.002)
         else:
-            # Full-height column rising to main ceiling: register as slab cutout for any upper floor it pierces
-            col_z_max = z_top_limit - 0.002 if (z_top_limit - z_hi) <= 0.65 else min(z_hi, z_top_limit - 0.002)
+            # Full-height column rising to local ceiling: register as slab cutout for any upper floor it pierces
+            col_z_max = local_ceil_top - 0.002 if (local_ceil_top - z_hi) <= 0.65 else min(z_hi, local_ceil_top - 0.002)
 
         if col_z_max <= col_z_min + 0.20:
             continue
@@ -232,7 +250,8 @@ def build_beam_parts(
         return [], {"emitted_count": 0, "reason": "insufficient_beam_points"}
 
     z_ceil = fc.ceiling_z if fc.ceiling_z is not None else float(np.percentile(beam_pts[:, 2], 98))
-    overhead = beam_pts[(beam_pts[:, 2] <= z_ceil + 0.08) & (beam_pts[:, 2] >= fc.floor_z + 1.5)]
+    z_ceil_max = max([c.z_bottom for c in fc.ceiling_levels], default=z_ceil)
+    overhead = beam_pts[(beam_pts[:, 2] <= z_ceil_max + 0.08) & (beam_pts[:, 2] >= fc.floor_z + 1.5)]
     if len(overhead) < cfg.beam_min_points:
         return [], {"emitted_count": 0, "reason": "insufficient_overhead_beam_points"}
 

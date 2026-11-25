@@ -248,6 +248,19 @@ def _apply_wl_a_ceiling(
     promoted_slabs = 0
     primary_xy_cells: set[tuple[int, int]] = set()
     primary_z: float | None = None
+    promoted_planes: list[tuple[float, set[tuple[int, int]]]] = []
+    # Precompute 0.50m XY interior coverage of floor (1) + stairs (13) so higher secondary ceilings
+    # must sit over genuine interior floor/stair space (blocks outdoor/rooftop overhangs outside the room!).
+    int_pts = points[(work_labels == 1) | (work_labels == 13)]
+    interior_cells_50: set[tuple[int, int]] = set()
+    if len(int_pts) > 0:
+        base_ic = np.unique(np.floor(int_pts[:, :2] / 0.50).astype(np.int64), axis=0)
+        interior_cells_50 = {
+            (int(c[0]) + dx, int(c[1]) + dy)
+            for c in base_ic
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+        }
 
     for _ in range(5):
         cand_local = np.flatnonzero(remaining_mask)
@@ -291,20 +304,39 @@ def _apply_wl_a_ceiling(
             for c in np.unique(np.floor(inlier_pts[:, :2] / 0.25).astype(np.int64), axis=0)
         }
         if promoted_slabs == 0:
-            primary_xy_cells = coarse_cells
+            # Dilate primary ceiling XY footprint by 1 coarse cell (0.25m) to close narrow beam/pipe scan gaps.
+            primary_xy_cells = {
+                (cx + dx, cy + dy)
+                for (cx, cy) in coarse_cells
+                for dx in (-1, 0, 1)
+                for dy in (-1, 0, 1)
+            }
             primary_z = float(centroid[2])
         else:
-            # Secondary wing ceiling must be a genuine lower-wing ceiling (>=0.80m below primary roof,
-            # never rooftop/attic scan bleed floating above the primary ceiling) and mostly outside primary XY.
+            # Secondary wing/stairwell ceiling (lower OR higher than primary!) must differ by >=0.65m,
+            # sit >=50% outside the primary ceiling footprint, AND (when higher) cover >=55% interior floor/stair space!
             outside_ratio = len(coarse_cells - primary_xy_cells) / max(len(coarse_cells), 1)
-            if primary_z is not None and (float(centroid[2]) > primary_z - 0.80):
+            if primary_z is not None and abs(float(centroid[2]) - primary_z) < 0.65:
                 continue
             if outside_ratio < 0.50:
                 continue
+            is_higher = primary_z is not None and float(centroid[2]) > primary_z + 0.65
+            if is_higher:
+                if area < 4.0:
+                    continue
+                if interior_cells_50:
+                    cand_cells_50 = {
+                        (int(c[0]), int(c[1]))
+                        for c in np.unique(np.floor(inlier_pts[:, :2] / 0.50).astype(np.int64), axis=0)
+                    }
+                    in_room_ratio = len(cand_cells_50 & interior_cells_50) / max(len(cand_cells_50), 1)
+                    if in_room_ratio < 0.55:
+                        continue
 
         work_labels[inlier_global] = 11
         rule_ids[inlier_global] = RULE_WL_A_CEILING_0_TO_11
         promoted_slabs += 1
+        promoted_planes.append((float(centroid[2]), coarse_cells))
         mn, mx = _bbox_summary(inlier_pts)
         adjustments.append(
             WorkingLabelAdjustment(
@@ -324,6 +356,89 @@ def _apply_wl_a_ceiling(
                 },
             )
         )
+
+    # WL-A2: Recover AI-mislabeled ceiling patches tagged as class 1 (floor) that are coplanar
+    # with a verified ceiling plane (|z - cz| <= 0.12m) AND have no upper room/ceiling above them.
+    # Real upper-storey floors always have walls/furniture/ceiling >= 0.35m above them, so they are untouched.
+    if not promoted_planes:
+        pre_c = points[work_labels == 11]
+        if len(pre_c) >= 500:
+            cz_pre = float(np.median(pre_c[:, 2]))
+            if cz_pre >= z_floor + cfg.ceiling_min_height_above_floor_m:
+                c_cells_pre = {
+                    (int(c[0]), int(c[1]))
+                    for c in np.unique(np.floor(pre_c[:, :2] / 0.25).astype(np.int64), axis=0)
+                }
+                promoted_planes.append((cz_pre, c_cells_pre))
+
+    floor_idx = np.flatnonzero(work_labels == 1)
+    if len(floor_idx) > 0 and promoted_planes:
+        f_pts = points[floor_idx]
+        col_vox = 0.50
+        all_col_xy = np.floor(points[:, :2] / col_vox).astype(np.int64)
+        for cz, _c_cells in promoted_planes:
+            if cz < z_floor + cfg.ceiling_min_height_above_floor_m:
+                continue
+            coplanar_local = np.flatnonzero(np.abs(f_pts[:, 2] - cz) <= 0.12)
+            if len(coplanar_local) < 300:
+                continue
+            cand_pts = f_pts[coplanar_local]
+            cand_cells_xy = np.floor(cand_pts[:, :2] / col_vox).astype(np.int64)
+            uniq_cand_cells = {
+                (int(c[0]), int(c[1])) for c in np.unique(cand_cells_xy, axis=0)
+            }
+            if len(uniq_cand_cells) * (col_vox * col_vox) < 1.0:
+                continue
+
+            # Check whether a real upper room exists above these XY columns (points > cz + 0.35m)
+            above_mask = points[:, 2] > cz + 0.35
+            occupied_above_cells: set[tuple[int, int]] = set()
+            if np.any(above_mask):
+                ab_xy = all_col_xy[above_mask]
+                uniq_ab, counts_ab = np.unique(ab_xy, axis=0, return_counts=True)
+                # Require >= 25 points in a 0.5m column above cz + 0.35m to count as a genuine upper storey
+                for cell_xy, cnt in zip(uniq_ab, counts_ab):
+                    if int(cnt) >= 25:
+                        occupied_above_cells.add((int(cell_xy[0]), int(cell_xy[1])))
+
+            keep_mask = np.array(
+                [(int(c[0]), int(c[1])) not in occupied_above_cells for c in cand_cells_xy],
+                dtype=bool,
+            )
+            promote_local = coplanar_local[keep_mask]
+            if len(promote_local) < 300:
+                continue
+            promote_global = floor_idx[promote_local]
+            p_pts = points[promote_global]
+            p_vox = cfg.ceiling_voxel_size_m
+            p_area = float(len(np.unique(np.floor(p_pts[:, :2] / p_vox).astype(np.int64), axis=0))) * (p_vox * p_vox)
+            if p_area < 1.0 or abs(float(np.median(p_pts[:, 2])) - cz) > 0.08:
+                continue
+
+            work_labels[promote_global] = 11
+            rule_ids[promote_global] = RULE_WL_A_CEILING_0_TO_11
+            mn, mx = _bbox_summary(p_pts)
+            adjustments.append(
+                WorkingLabelAdjustment(
+                    rule_id=RULE_WL_A_CEILING_0_TO_11,
+                    rule_name="WL-A2_ceiling_mislabeled_as_floor",
+                    raw_class=1,
+                    work_class=11,
+                    point_count=int(len(promote_global)),
+                    bbox_min_local=mn,
+                    bbox_max_local=mx,
+                    evidence={
+                        "matched_ceiling_z_local": round(float(cz), 4),
+                        "promoted_z_median_local": round(float(np.median(p_pts[:, 2])), 4),
+                        "occupied_area_m2": round(p_area, 3),
+                    },
+                )
+            )
+            # Refresh remaining floor_idx for any subsequent ceiling plane
+            floor_idx = np.flatnonzero(work_labels == 1)
+            if len(floor_idx) == 0:
+                break
+            f_pts = points[floor_idx]
 
 
 def _apply_wl_b_isolated_noise(

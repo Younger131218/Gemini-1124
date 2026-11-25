@@ -151,6 +151,9 @@ def plan_exterior_wall_shell(
     walls: list[WallSegment] = []
     wall_polys: dict[str, Polygon] = {}
     wall_audit: list[dict[str, Any]] = []
+    hi_ceils = [c for c in fc.ceiling_levels if (not c.is_primary) and c.z_bottom > z_top + 0.45]
+    max_hi_ceil = max((float(c.z_bottom) for c in hi_ceils), default=z_top)
+    wall_uvz_all = fc.frame.pts_to_uvz(points_local[work_labels == 2]) if hi_ceils else np.empty((0, 3), dtype=np.float64)
 
     for i in range(n):
         if i not in wall_polys_by_idx:
@@ -159,6 +162,38 @@ def plan_exterior_wall_shell(
         p1_in = in_coords[(i + 1) % n]
         wid = f"ext_wall_{i:02d}"
         ev = evidences[i]
+        # Per-wall local ceiling height: walls enclosing a higher stairwell/wing ceiling rise to max_hi_ceil!
+        # For a long shared wall (e.g. 1F lobby + 2F stairwell), keep 1F base at z_top and attach an upper_extension
+        # along the measured high-wall segment [s_lo, s_hi] so the 1F lobby wall stays flush under ceiling_primary.
+        w_z_top = z_top
+        upper_ext: list[float] | None = None
+        seg_len = float(np.linalg.norm(p1_in - p0_in))
+        if hi_ceils and len(wall_uvz_all) > 0 and seg_len > 0.05:
+            rel_w = wall_uvz_all[:, :2] - p0_in[None, :]
+            s_w = rel_w @ tangents[i]
+            d_w = np.abs(rel_w @ normals[i])
+            hi_mask = (
+                (s_w >= -0.08)
+                & (s_w <= seg_len + 0.08)
+                & (d_w <= max(0.28, med_thick + 0.10))
+                & (wall_uvz_all[:, 2] >= z_top + 0.25)
+            )
+            if int(np.sum(hi_mask)) >= 300:
+                s_hi_vals = s_w[hi_mask]
+                s_hi_lo = max(0.0, float(np.percentile(s_hi_vals, 2)) - 0.10)
+                s_hi_hi = min(seg_len, float(np.percentile(s_hi_vals, 98)) + 0.10)
+                if (s_hi_hi - s_hi_lo) >= 0.60 * seg_len or seg_len <= 3.8:
+                    w_z_top = max_hi_ceil
+                elif (s_hi_hi - s_hi_lo) >= 0.50:
+                    upper_ext = [round(s_hi_lo, 4), round(s_hi_hi, 4), round(max_hi_ceil, 4)]
+
+        meta: dict[str, Any] = {
+            "foot_completed_m": round(max(0.0, float(ev["measured_z_min"]) - fc.floor_z), 4),
+            "head_completed_m": round(max(0.0, w_z_top - float(ev["measured_z_max"])), 4),
+        }
+        if upper_ext is not None:
+            meta["upper_extension"] = upper_ext
+
         wseg = WallSegment(
             wall_id=wid,
             p0_xy=p0_in.copy(),
@@ -167,16 +202,13 @@ def plan_exterior_wall_shell(
             tangent_xy=tangents[i].copy(),
             thickness_m=med_thick,
             z_min=fc.floor_z,
-            z_max=z_top,
+            z_max=w_z_top,
             is_exterior=True,
             point_count=int(ev["point_count"]),
             measured_z_min=float(ev["measured_z_min"]),
             measured_z_max=float(ev["measured_z_max"]),
             anchor_mode=str(ev["anchor_mode"]),
-            metadata={
-                "foot_completed_m": round(max(0.0, float(ev["measured_z_min"]) - fc.floor_z), 4),
-                "head_completed_m": round(max(0.0, z_top - float(ev["measured_z_max"])), 4),
-            },
+            metadata=meta,
         )
         walls.append(wseg)
         wall_polys[wid] = wall_polys_by_idx[i]
@@ -235,6 +267,29 @@ def _slice_wall_poly_along_s(
     return out
 
 
+def collect_raised_exterior_wall_cutouts(
+    fc: FloorCeilingResult,
+    shell: ExteriorShellPlan,
+) -> list[tuple[Polygon, float, float]]:
+    """Return (poly_uv, z_min, z_max) cutouts for raised stairwell exterior walls so primary ceiling stops flush."""
+    if fc.ceiling_z is None:
+        return []
+    cutouts: list[tuple[Polygon, float, float]] = []
+    for w in shell.walls:
+        wpoly = shell.wall_polys_uv[w.wall_id]
+        if w.z_max > fc.ceiling_z + 0.05:
+            cutouts.append((wpoly, w.z_min, w.z_max))
+        uext = w.metadata.get("upper_extension")
+        if uext is not None:
+            sa_hi, sb_hi, z_hi_top = float(uext[0]), float(uext[1]), float(uext[2])
+            if z_hi_top > w.z_max + 0.05:
+                is_first = sa_hi <= 0.15
+                is_last = sb_hi >= w.length_m - 0.15
+                for sp in _slice_wall_poly_along_s(wpoly, w, sa_hi, sb_hi, is_first=is_first, is_last=is_last):
+                    cutouts.append((sp, w.z_max + 0.002, z_hi_top))
+    return cutouts
+
+
 def build_exterior_wall_parts(
     fc: FloorCeilingResult,
     shell: ExteriorShellPlan,
@@ -247,6 +302,35 @@ def build_exterior_wall_parts(
         length = w.length_m
         if length < 0.05 or w.z_max <= w.z_min + 0.02:
             continue
+
+        # Emit upper stairwell extension on long shared walls (disjoint 2mm above 1F wall top)
+        uext = w.metadata.get("upper_extension")
+        if uext is not None:
+            sa_hi, sb_hi, z_hi_top = float(uext[0]), float(uext[1]), float(uext[2])
+            if z_hi_top > w.z_max + 0.05:
+                is_first = sa_hi <= 0.15
+                is_last = sb_hi >= length - 0.15
+                for u_idx, sp in enumerate(_slice_wall_poly_along_s(wpoly, w, sa_hi, sb_hi, is_first=is_first, is_last=is_last)):
+                    try:
+                        uv_v, uv_t = extrude_polygon_solid(sp, w.z_max + 0.002, z_hi_top)
+                    except ValueError:
+                        continue
+                    parts.append(
+                        MeshPart(
+                            part_id=f"{w.wall_id}_upper_{u_idx:02d}",
+                            class_id=2,
+                            role="exterior_wall",
+                            vertices=fc.frame.uvz_to_xyz(uv_v),
+                            triangles=uv_t,
+                            evidence_kind="measured",
+                            metadata={
+                                "wall_id": w.wall_id,
+                                "s_range": [round(sa_hi, 4), round(sb_hi, 4)],
+                                "z_range": [round(w.z_max + 0.002, 4), round(z_hi_top, 4)],
+                                "thickness_m": w.thickness_m,
+                            },
+                        )
+                    )
 
         openings = sorted(w.openings, key=lambda o: o.s_min)
         if not openings:

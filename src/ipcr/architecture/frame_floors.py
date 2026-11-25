@@ -80,23 +80,42 @@ class FloorCeilingResult:
 
 
 def estimate_room_frame(points_local: np.ndarray, work_labels: np.ndarray) -> RoomFrame:
-    """Estimate dominant room wall orientation via 4-fold circular voting on vertical wall planes."""
+    """Estimate dominant room wall orientation via weighted 1D mode peak voting on (angle mod 90 deg).
+
+    Unlike a global 4-fold circular mean (which averages two wall families in a trapezoidal/angled
+    lobby into a phantom midpoint matching neither wall!), kernel mode voting locks strictly onto
+    the strongest true wall family while keeping angled walls crisp and un-warped!
+    """
     wall_pts = points_local[work_labels == 2]
     planes = _extract_dominant_vertical_wall_planes(
-        wall_pts, voxel_size=0.06, plane_dist=0.05, min_plane_voxels=60, max_planes=16
+        wall_pts, voxel_size=0.06, plane_dist=0.05, min_plane_voxels=60, max_planes=20
     )
     if not planes:
         return RoomFrame(angle_rad=0.0, cos_a=1.0, sin_a=0.0)
 
-    sx, sy = 0.0, 0.0
+    # Accumulate Gaussian-smoothed weighted votes over [0, 90) degrees (1 deg bins)
+    plane_entries: list[tuple[float, float]] = []
+    hist = np.zeros(90, dtype=np.float64)
     for _c, n, bmin, bmax in planes:
-        ang = float(np.arctan2(n[1], n[0]))
+        ang_deg = float(np.degrees(np.arctan2(n[1], n[0]))) % 90.0
         span = bmax - bmin
         weight = float(np.hypot(span[0], span[1])) * max(float(span[2]), 0.5)
-        sx += weight * float(np.cos(4.0 * ang))
-        sy += weight * float(np.sin(4.0 * ang))
+        plane_entries.append((ang_deg, weight))
+        for d in range(-3, 4):
+            b = int(round(ang_deg) + d) % 90
+            hist[b] += weight * float(np.exp(-0.5 * (d / 1.4) ** 2))
 
-    angle = 0.25 * float(np.arctan2(sy, sx))
+    peak_deg = float(int(np.argmax(hist)))
+    # Refine exact sub-degree angle via 4-fold circular mean ONLY over planes within +-5 deg of the winning mode!
+    sx, sy = 0.0, 0.0
+    for ang_deg, w in plane_entries:
+        diff = ((ang_deg - peak_deg + 45.0) % 90.0) - 45.0
+        if abs(diff) <= 5.0:
+            rad = float(np.radians(ang_deg))
+            sx += w * float(np.cos(4.0 * rad))
+            sy += w * float(np.sin(4.0 * rad))
+
+    angle = 0.25 * float(np.arctan2(sy, sx)) if (abs(sx) + abs(sy)) > 1e-9 else float(np.radians(peak_deg))
     while angle >= np.pi / 4.0:
         angle -= np.pi / 2.0
     while angle < -np.pi / 4.0:
@@ -285,8 +304,12 @@ def _remove_small_raster_jogs(pts: np.ndarray, *, max_jog_m: float = 0.45, min_n
     return arr
 
 
-def _snap_orthogonal_polygon(poly: Polygon, *, simplify_tol: float = 0.14, min_edge_len: float = 0.25) -> Polygon:
-    """Simplify raster staircase edges, remove tiny wall kinks, and snap near-axis wall edges."""
+def _snap_orthogonal_polygon(poly: Polygon, *, simplify_tol: float = 0.16, min_edge_len: float = 0.25) -> Polygon:
+    """Simplify raster staircase edges and snap ONLY genuinely near-axis edges (<=5 deg & <=0.16m endpoint shift).
+
+    Real non-orthogonal / slanted architectural walls (>5 deg off-axis) are preserved as clean straight diagonals
+    instead of swinging +-1m outside the real wall or breaking into jagged raster staircases!
+    """
     smoothed = poly.buffer(0.10, join_style=2).buffer(-0.10, join_style=2)
     if isinstance(smoothed, MultiPolygon):
         smoothed = max(smoothed.geoms, key=lambda g: g.area)
@@ -308,11 +331,12 @@ def _snap_orthogonal_polygon(poly: Polygon, *, simplify_tol: float = 0.14, min_e
             if length < 1e-4:
                 continue
             ang = abs(float(np.degrees(np.arctan2(abs(dy), abs(dx)))))
-            if ang < 12.0:
+            # Strict displacement guard: never swing a long slanted wall >0.16m per endpoint!
+            if ang < 5.5 and 0.5 * abs(dy) <= 0.16:
                 mid_v = 0.5 * (pts[i, 1] + pts[j, 1])
                 pts[i, 1] = mid_v
                 pts[j, 1] = mid_v
-            elif ang > 78.0:
+            elif ang > 84.5 and 0.5 * abs(dx) <= 0.16:
                 mid_u = 0.5 * (pts[i, 0] + pts[j, 0])
                 pts[i, 0] = mid_u
                 pts[j, 0] = mid_u
@@ -619,15 +643,16 @@ def analyze_floor_and_ceiling(
                         is_primary=is_prim,
                     )
                 )
-        # Keep primary ceiling + genuine lower side-wing ceilings (below primary roof and >=50% outside primary XY)
+        # Keep primary ceiling + genuine side-wing / stairwell ceilings (lower OR higher by >=0.65m and outside primary XY)
         for clv in raw_clvs:
             if clv.is_primary or primary_cpoly is None:
                 ceiling_levels.append(clv)
             else:
-                if clv.z_bottom > ceiling_z - 0.80:
+                if abs(clv.z_bottom - ceiling_z) < 0.65:
                     continue
                 outside_area = float(clv.polygon_uv.difference(primary_cpoly).area)
-                if outside_area >= max(1.5, float(clv.polygon_uv.area) * 0.50):
+                min_out_area = 4.0 if clv.z_bottom > ceiling_z + 0.65 else 1.5
+                if outside_area >= max(min_out_area, float(clv.polygon_uv.area) * 0.50):
                     ceiling_levels.append(clv)
 
     # Build Level-0 2D occupancy grid combining 1F floor + attached columns + stairs shadow footprint
@@ -673,6 +698,20 @@ def analyze_floor_and_ceiling(
     snapped_poly, squared_bevels = _square_spurious_corner_bevels(snapped_poly, wall_uvz)
     if squared_bevels > 0:
         snapped_poly, edge_logs = _refine_footprint_edges_to_walls(snapped_poly, wall_uvz)
+
+    # Filter any higher secondary ceiling that lies mostly OUTSIDE the snapped interior room footprint
+    # (blocks outdoor rooftop/canopy overhangs while keeping genuine indoor stairwell/mezzanine ceilings!)
+    if ceiling_z is not None and len(ceiling_levels) > 1:
+        room_guard = snapped_poly.buffer(0.25)
+        filtered_clvs: list[CeilingLevel] = []
+        for clv in ceiling_levels:
+            if clv.is_primary or clv.z_bottom <= ceiling_z + 0.65:
+                filtered_clvs.append(clv)
+            else:
+                in_room_ratio = float(clv.polygon_uv.intersection(room_guard).area) / max(float(clv.polygon_uv.area), 1e-6)
+                if in_room_ratio >= 0.55:
+                    filtered_clvs.append(clv)
+        ceiling_levels = filtered_clvs
 
     # Assemble structured floor_levels (Level 0 = snapped primary footprint, Level k>=1 = upper mezzanines)
     floor_levels: list[FloorLevel] = [
@@ -842,6 +881,10 @@ def build_floor_and_ceiling_parts(
         for up_poly, ub, ut in upper_slab_bands:
             if abs(ut - zc_bot) <= 0.25 or (ub <= zc_top + 0.05 and ut >= zc_bot - 0.05):
                 rel_c_cuts.append(up_poly.buffer(0.008))
+        # Also subtract higher-wing ceiling zones (e.g. a 2F stairwell roof above the 1F lobby ceiling!)
+        for clv_hi in fc.ceiling_levels:
+            if (not clv_hi.is_primary) and clv_hi.z_bottom > zc_bot + 0.65:
+                rel_c_cuts.append(clv_hi.polygon_uv.buffer(0.05))
         if rel_c_cuts:
             c_poly = c_poly.difference(unary_union(rel_c_cuts)).buffer(0)
         geoms_c = (
@@ -878,7 +921,9 @@ def build_floor_and_ceiling_parts(
             )
             c_idx += 1
 
-    # 4. Secondary lower-wing ceiling slabs (strictly inside inner_uv, disjoint from primary ceiling & upper floors)
+    # 4. Secondary ceiling slabs:
+    #    - Lower wing ceiling: strictly inside inner_dom (walls rise past it to primary ceiling).
+    #    - Higher stairwell/mezzanine roof: spans onto outer_shell_uv flush atop raised exterior walls!
     for clv in fc.ceiling_levels:
         if clv.is_primary or fc.ceiling_z is None:
             continue
@@ -887,7 +932,10 @@ def build_floor_and_ceiling_parts(
         # Skip if overlapping primary ceiling vertically
         if zc_top >= fc.ceiling_z - 0.02 and zc_bot <= fc.ceiling_z + cfg.ceiling_thickness_m + 0.02:
             continue
-        cpoly = clv.polygon_uv.intersection(inner_dom).buffer(0)
+        if zc_bot > fc.ceiling_z + 0.65:
+            cpoly = clv.polygon_uv.buffer(max(0.32, cfg.min_wall_thickness_m + 0.14)).intersection(outer_shell_uv).buffer(0)
+        else:
+            cpoly = clv.polygon_uv.intersection(inner_dom).buffer(0)
         # Subtract any upper floor slab or cutout overlapping vertically
         block_z = [
             p.buffer(0.006)
