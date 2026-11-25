@@ -95,6 +95,100 @@ def make_axis_aligned_box(
     )
 
 
+def _orthonormal_basis_from_axis(axis: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    w = np.asarray(axis, dtype=np.float64).reshape(3)
+    wn = float(np.linalg.norm(w))
+    if wn < 1e-12:
+        raise ValueError("Cylinder/cone axis cannot be zero")
+    w = w / wn
+    ref = np.array([1.0, 0.0, 0.0], dtype=np.float64) if abs(w[0]) < 0.85 else np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    u = np.cross(w, ref)
+    u /= max(float(np.linalg.norm(u)), 1e-12)
+    v = np.cross(w, u)
+    v /= max(float(np.linalg.norm(v)), 1e-12)
+    return u, v, w
+
+
+def make_oriented_cylinder(
+    p0_xyz: np.ndarray,
+    p1_xyz: np.ndarray,
+    radius: float,
+    *,
+    segments: int = 20,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create a closed manifold cylinder along ANY 3D axis (vertical, horizontal, or oblique; B18)."""
+    p0 = np.asarray(p0_xyz, dtype=np.float64).reshape(3)
+    p1 = np.asarray(p1_xyz, dtype=np.float64).reshape(3)
+    r = float(radius)
+    seg = max(6, int(segments))
+    axis = p1 - p0
+    length = float(np.linalg.norm(axis))
+    if length <= 1e-6 or r <= 1e-6:
+        raise ValueError(f"Invalid cylinder length={length} radius={r}")
+    u, v, _w = _orthonormal_basis_from_axis(axis)
+
+    angles = np.linspace(0.0, 2.0 * np.pi, seg, endpoint=False)
+    cos_a = np.cos(angles)
+    sin_a = np.sin(angles)
+    ring_offsets = (cos_a[:, None] * u[None, :] + sin_a[:, None] * v[None, :]) * r
+
+    # Layout: [0..seg-1] bottom ring, [seg..2*seg-1] top ring, [2*seg] bottom center, [2*seg+1] top center
+    verts = np.vstack([p0[None, :] + ring_offsets, p1[None, :] + ring_offsets, p0[None, :], p1[None, :]])
+    c_bot = 2 * seg
+    c_top = 2 * seg + 1
+    tris: list[tuple[int, int, int]] = []
+    for i in range(seg):
+        j = (i + 1) % seg
+        # Bottom cap (outward -w)
+        tris.append((c_bot, j, i))
+        # Top cap (outward +w)
+        tris.append((c_top, seg + i, seg + j))
+        # Side quad (2 tris, outward radial)
+        tris.append((i, j, seg + j))
+        tris.append((i, seg + j, seg + i))
+    tri_arr = np.asarray(tris, dtype=np.uint32)
+    if signed_mesh_volume(verts, tri_arr) < 0:
+        tri_arr = tri_arr[:, [0, 2, 1]]
+    return verts, tri_arr
+
+
+def make_oriented_cone_or_pyramid(
+    base_center_xyz: np.ndarray,
+    apex_xyz: np.ndarray,
+    base_radius: float,
+    *,
+    sides: int = 3,
+    phase_rad: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create a closed manifold triangular pyramid (sides=3), square pyramid (sides=4), or cone (sides>=12) (B18)."""
+    bc = np.asarray(base_center_xyz, dtype=np.float64).reshape(3)
+    ap = np.asarray(apex_xyz, dtype=np.float64).reshape(3)
+    r = float(base_radius)
+    n = max(3, int(sides))
+    axis = ap - bc
+    height = float(np.linalg.norm(axis))
+    if height <= 1e-6 or r <= 1e-6:
+        raise ValueError(f"Invalid pyramid/cone height={height} radius={r}")
+    u, v, _w = _orthonormal_basis_from_axis(axis)
+
+    angles = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False) + float(phase_rad)
+    ring_offsets = (np.cos(angles)[:, None] * u[None, :] + np.sin(angles)[:, None] * v[None, :]) * r
+
+    # Layout: [0..n-1] base ring, [n] base center, [n+1] apex
+    verts = np.vstack([bc[None, :] + ring_offsets, bc[None, :], ap[None, :]])
+    c_bot = n
+    apex_i = n + 1
+    tris: list[tuple[int, int, int]] = []
+    for i in range(n):
+        j = (i + 1) % n
+        tris.append((c_bot, j, i))
+        tris.append((i, j, apex_i))
+    tri_arr = np.asarray(tris, dtype=np.uint32)
+    if signed_mesh_volume(verts, tri_arr) < 0:
+        tri_arr = tri_arr[:, [0, 2, 1]]
+    return verts, tri_arr
+
+
 def _clean_ring(coords: list[tuple[float, float]], eps: float = 1e-6) -> list[tuple[float, float]]:
     pts = [(float(x), float(y)) for x, y in coords[:-1]]  # drop closing duplicate
     out: list[tuple[float, float]] = []

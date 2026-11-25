@@ -21,6 +21,7 @@ class SceneCloud:
     raw_labels: np.ndarray  # shape (N,), uint8 — NEVER mutated
     global_min: np.ndarray  # shape (3,), float64
     global_max: np.ndarray  # shape (3,), float64
+    rgb_uint8: np.ndarray | None = None  # optional shape (N, 3), uint8 (0..255) for B18 plant check
 
     @property
     def point_count(self) -> int:

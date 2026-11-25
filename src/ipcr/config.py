@@ -92,6 +92,22 @@ class FurnitureConfig:
 
 
 @dataclass
+class ClutterConfig:
+    enabled: bool = True
+    min_points: int = 250
+    voxel_cluster_size_m: float = 0.055
+    min_extent_m: float = 0.035
+    min_major_span_m: float = 0.16
+    min_volume_m3: float = 0.002
+    plant_green_ratio_threshold: float = 0.16
+    regularity_max_surface_p90_m: float = 0.065
+    regularity_max_surface_p50_m: float = 0.036
+    min_cylinder_arc_deg: float = 120.0
+    cylinder_segments: int = 20
+    clearance_m: float = 0.008
+
+
+@dataclass
 class ValidationConfig:
     min_triangle_area_m2: float = 1e-10
     min_solid_volume_m3: float = 1e-7
@@ -108,6 +124,7 @@ class PipelineConfig:
     working_labels: WorkingLabelConfig = field(default_factory=WorkingLabelConfig)
     architecture: ArchitectureConfig = field(default_factory=ArchitectureConfig)
     furniture: FurnitureConfig = field(default_factory=FurnitureConfig)
+    clutter: ClutterConfig = field(default_factory=ClutterConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
 
     def to_dict(self) -> dict[str, Any]:
@@ -120,6 +137,7 @@ class PipelineConfig:
             working_labels=WorkingLabelConfig(**data.get("working_labels", {})),
             architecture=ArchitectureConfig(**data.get("architecture", {})),
             furniture=FurnitureConfig(**data.get("furniture", {})),
+            clutter=ClutterConfig(**data.get("clutter", {})),
             validation=ValidationConfig(**data.get("validation", {})),
         )
 

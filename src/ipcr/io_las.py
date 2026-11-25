@@ -45,6 +45,17 @@ def load_las(path: str | Path, *, origin_xyz: np.ndarray | None = None) -> Scene
     points_local[:, 1] = y - origin[1]
     points_local[:, 2] = z - origin[2]
 
+    rgb_uint8: np.ndarray | None = None
+    dims = set(las.point_format.dimension_names)
+    if {"red", "green", "blue"}.issubset(dims):
+        r = np.asarray(las.red)
+        g = np.asarray(las.green)
+        b = np.asarray(las.blue)
+        if max(int(r.max(initial=0)), int(g.max(initial=0)), int(b.max(initial=0))) > 255:
+            rgb_uint8 = np.column_stack([(r >> 8), (g >> 8), (b >> 8)]).astype(np.uint8)
+        else:
+            rgb_uint8 = np.column_stack([r, g, b]).astype(np.uint8)
+
     return SceneCloud(
         source_path=str(las_path),
         sha256=digest,
@@ -55,6 +66,7 @@ def load_las(path: str | Path, *, origin_xyz: np.ndarray | None = None) -> Scene
         raw_labels=raw_labels,
         global_min=gmin,
         global_max=gmax,
+        rgb_uint8=rgb_uint8,
     )
 
 

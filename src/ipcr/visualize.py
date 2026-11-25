@@ -45,7 +45,12 @@ def render_arch_review_png(
     uvz = fc.frame.pts_to_uvz(pts)
 
     fig, axes = plt.subplots(2, 2, figsize=(15, 12), dpi=130)
-    stage_title = "Stage-2 Architecture & Furniture Review" if any(p.class_id in (7, 8, 9, 10) for p in parts) else "Stage-1 Architecture Review"
+    has_clutter = any(p.class_id == 12 for p in parts)
+    stage_title = (
+        "Stage-3 Full Architecture, Furniture & Clutter Review"
+        if has_clutter
+        else ("Stage-2 Architecture & Furniture Review" if any(p.class_id in (7, 8, 9, 10) for p in parts) else "Stage-1 Architecture Review")
+    )
     fig.suptitle(f"IPCR v2 {stage_title} ({Path(cloud.source_path).name})", fontsize=13)
 
     # Panel 1: Room-aligned UV Top-Down Plan (structural point cloud vs outer/inner shell + openings + columns)
@@ -124,10 +129,17 @@ def render_arch_review_png(
 
     # Panel 3: Furniture (when built) OR Beams & Columns UV Plan
     ax = axes[1, 0]
-    has_furniture = any(p.class_id in (7, 8, 9, 10) for p in parts)
+    has_furniture = any(p.class_id in (7, 8, 9, 10, 12) for p in parts)
     if has_furniture:
-        ax.set_title("3. Stage-2 Furniture Plan: Cloud vs Reconstructed Tables / Chairs / Cabinets / Sofas")
-        for fcid, flbl in ((8, "table cloud"), (7, "chair cloud"), (9, "cabinet cloud"), (10, "sofa cloud")):
+        ax.set_title(
+            "3. Stage-3 Furniture & Clutter Plan: Cloud vs Reconstructed Objects"
+            if has_clutter
+            else "3. Stage-2 Furniture Plan: Cloud vs Reconstructed Tables / Chairs / Cabinets / Sofas"
+        )
+        plot_specs = [(8, "table cloud"), (7, "chair cloud"), (9, "cabinet cloud"), (10, "sofa cloud")]
+        if has_clutter:
+            plot_specs.append((12, "clutter cloud"))
+        for fcid, flbl in plot_specs:
             fidx = np.flatnonzero(wl == fcid)
             if len(fidx) == 0:
                 continue
@@ -136,9 +148,9 @@ def render_arch_review_png(
             rgba = palette.get(str(fcid), {}).get("rgba", [0.5, 0.5, 0.5, 1.0])
             ax.scatter(uvz[fidx, 0], uvz[fidx, 1], s=0.8, alpha=0.35, color=rgba[:3], label=flbl)
         ax.plot(ix, iy, color="black", lw=1.8)
-        fcolors = {7: "#4a148c", 8: "#1b5e20", 9: "#b71c1c", 10: "#880e4f"}
+        fcolors = {7: "#4a148c", 8: "#1b5e20", 9: "#b71c1c", 10: "#880e4f", 12: "#9e9d24"}
         for p in parts:
-            if p.class_id not in (7, 8, 9, 10):
+            if p.class_id not in (7, 8, 9, 10, 12):
                 continue
             if p.role == "table_leg":
                 continue

@@ -18,6 +18,7 @@ from ipcr.architecture.walls_shell import (
     plan_exterior_wall_shell,
 )
 from ipcr.baseline import verify_frozen_baseline
+from ipcr.clutter import build_clutter_parts
 from ipcr.config import PipelineConfig, load_class_ids
 from ipcr.export_glb import export_glb_pair
 from ipcr.furniture import (
@@ -40,15 +41,17 @@ def run_pipeline(
     las_path: str | Path,
     output_dir: str | Path,
     *,
-    stage: str = "furniture",
+    stage: str = "full",
     cfg: PipelineConfig | None = None,
     library_root: str | Path | None = None,
     basename: str | None = None,
     render_preview: bool = True,
 ) -> dict[str, Any]:
-    """Run Stage 1 ('arch') or Stage 2 ('furniture') reconstruction with independent post-export validation."""
-    if stage not in ("arch", "furniture"):
-        raise ValueError(f"Unsupported stage: {stage!r} (expected 'arch' or 'furniture')")
+    """Run Stage 1 ('arch'), Stage 2 ('furniture'), or Stage 3 ('full'/'clutter') reconstruction with post-export validation."""
+    if stage == "clutter":
+        stage = "full"
+    if stage not in ("arch", "furniture", "full"):
+        raise ValueError(f"Unsupported stage: {stage!r} (expected 'arch', 'furniture', or 'full')")
 
     t0 = time.perf_counter()
     baseline_res = verify_frozen_baseline()
@@ -122,7 +125,8 @@ def run_pipeline(
 
     # 6. Stage 2 Furniture: Tables (8) -> Cabinets (9) -> Sofas (10) -> Library-Matched Chairs (7)
     furniture_audit: dict[str, Any] | None = None
-    if stage == "furniture" and pcfg.furniture.enabled:
+    table_specs = []
+    if stage in ("furniture", "full") and pcfg.furniture.enabled:
         lib_path = library_root if library_root is not None else pcfg.furniture.model_library_path
         library = FurnitureLibrary(library_root=lib_path)
 
@@ -161,6 +165,21 @@ def run_pipeline(
             "chairs": chair_audit,
         }
 
+    # 6b. Stage 3 Regular Clutter (B18): closed boxes, vertical/oblique cylinders, cones/pyramids + semantic exclusions
+    clutter_audit: dict[str, Any] | None = None
+    if stage == "full" and pcfg.clutter.enabled:
+        clutter_parts, clutter_audit = build_clutter_parts(
+            fc,
+            shell,
+            parts,
+            table_specs,
+            cloud.points_local,
+            wl_state.work_labels,
+            pcfg.clutter,
+            rgb_uint8=cloud.rgb_uint8,
+        )
+        parts.extend(clutter_parts)
+
     scene = SceneBuildResult(
         origin_xyz=cloud.origin_xyz,
         parts=parts,
@@ -171,7 +190,11 @@ def run_pipeline(
         main_angle_rad=fc.frame.angle_rad,
     )
 
-    stage_label = "stage2_arch_and_furniture" if stage == "furniture" else "stage1_architecture"
+    stage_label = (
+        "stage3_full_arch_furniture_clutter"
+        if stage == "full"
+        else ("stage2_arch_and_furniture" if stage == "furniture" else "stage1_architecture")
+    )
 
     # 7. Export R23 paired Z-up & Y-up GLBs
     export_info = export_glb_pair(
@@ -201,10 +224,13 @@ def run_pipeline(
         eval_classes.append(13)
     if any(p.class_id == 14 for p in parts) or stair_audit.get("railing_points_after_working_labels", 0) > 0:
         eval_classes.append(14)
-    if stage == "furniture":
+    if stage in ("furniture", "full"):
         for fcid in (7, 8, 9, 10):
             if any(p.class_id == fcid for p in parts) or int((wl_state.work_labels == fcid).sum()) > 0:
                 eval_classes.append(fcid)
+    if stage == "full":
+        if any(p.class_id == 12 for p in parts) or int((wl_state.work_labels == 12).sum()) > 0:
+            eval_classes.append(12)
     eval_classes = sorted(set(eval_classes))
 
     cloud_metrics = compute_bidirectional_class_metrics(
@@ -218,12 +244,12 @@ def run_pipeline(
     elapsed = round(time.perf_counter() - t0, 3)
     overall_pass = glb_val["status"] == "PASS" and rel_audit["status"] == "PASS"
 
-    not_checked = [
-        "Stage 3 regular clutter (class 12) not yet built",
-        "User visual overlay acceptance in host software pending",
-    ]
+    not_checked = ["User visual overlay acceptance in host software pending"]
     if stage == "arch":
         not_checked.insert(0, "Stage 2 furniture (classes 7, 8, 9, 10) not built in stage=arch")
+        not_checked.insert(1, "Stage 3 regular clutter (class 12) not built in stage=arch")
+    elif stage == "furniture":
+        not_checked.insert(0, "Stage 3 regular clutter (class 12) not built in stage=furniture")
 
     report: dict[str, Any] = {
         "status": "PASS" if overall_pass else "FAIL",
@@ -255,6 +281,7 @@ def run_pipeline(
             "stairs_railings": stair_audit,
         },
         "furniture": furniture_audit,
+        "clutter": clutter_audit,
         "export": export_info,
         "glb_validation": glb_val,
         "relation_audit": rel_audit,

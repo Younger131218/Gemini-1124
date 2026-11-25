@@ -39,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
     p_run = sub.add_parser("run", help="Run end-to-end reconstruction pipeline from raw LAS")
     p_run.add_argument("--las", required=True, help="Path to classified uncompressed .las")
     p_run.add_argument("--out", required=True, help="New output directory (never overwrites existing)")
-    p_run.add_argument("--stage", choices=["arch", "furniture"], default="furniture", help="Pipeline stage target")
+    p_run.add_argument("--stage", choices=["arch", "furniture", "full"], default="full", help="Pipeline stage target")
     p_run.add_argument("--library", default=None, help="Path to read-only GLB model library directory")
     p_run.add_argument("--config", default=None, help="Optional pipeline config JSON path")
     p_run.add_argument("--basename", default=None, help="Optional output basename (defaults to LAS stem)")

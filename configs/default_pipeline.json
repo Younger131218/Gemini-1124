@@ -75,6 +75,20 @@
     "chair_row_slot_m": 0.68,
     "clearance_m": 0.010
   },
+  "clutter": {
+    "enabled": true,
+    "min_points": 250,
+    "voxel_cluster_size_m": 0.055,
+    "min_extent_m": 0.035,
+    "min_major_span_m": 0.16,
+    "min_volume_m3": 0.002,
+    "plant_green_ratio_threshold": 0.16,
+    "regularity_max_surface_p90_m": 0.065,
+    "regularity_max_surface_p50_m": 0.036,
+    "min_cylinder_arc_deg": 120.0,
+    "cylinder_segments": 20,
+    "clearance_m": 0.008
+  },
   "validation": {
     "min_triangle_area_m2": 1e-10,
     "min_solid_volume_m3": 1e-7,
