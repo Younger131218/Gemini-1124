@@ -94,7 +94,7 @@ class FurnitureConfig:
 @dataclass
 class ClutterConfig:
     enabled: bool = True
-    min_points: int = 250
+    min_points: int = 600
     voxel_cluster_size_m: float = 0.055
     min_extent_m: float = 0.035
     min_major_span_m: float = 0.16

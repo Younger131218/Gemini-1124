@@ -263,6 +263,14 @@ def _fit_cone_or_pyramid(pts_u: np.ndarray, z0: float, z1: float) -> dict[str, A
     # Decide triangular pyramid (sides=3) vs circular cone (sides=18) by comparing radial residual to 3-gon vs circle
     rel_xy = pts_u[:, :2] - c_xy[None, :]
     ang = np.arctan2(rel_xy[:, 1], rel_xy[:, 0])
+    # Require genuine multi-side angular wrap (>= 220 deg) so one-sided doorway corner noise NEVER forms a pyramid!
+    ang_s = np.sort(ang)
+    gaps = np.diff(ang_s)
+    wrap_gap = float((ang_s[0] + 2.0 * np.pi) - ang_s[-1])
+    max_gap = max(float(gaps.max()) if len(gaps) else 2.0 * np.pi, wrap_gap)
+    arc_deg = float(np.degrees(max(0.0, 2.0 * np.pi - max_gap)))
+    if arc_deg < 220.0:
+        return None
     # Circular cone surface error
     cone_err = np.abs(actual_r - r_base_cone * taper) * (h / float(np.hypot(h, r_base_cone)))
     # Test 3-sided triangular pyramid across 24 phase angles (0..120 deg)
@@ -514,8 +522,8 @@ def build_clutter_parts(
             rejected_logs.append({"cluster_idx": ci, "point_count": int(len(rel_idx)), "reason": "outside_storey_z_band"})
             continue
 
-        # Support snapping: check if resting on a table top or floor
-        support_kind = "floating_or_wall_mounted"
+        # Support snapping: check physical support (floor, tabletop, ceiling-suspended, or wall-mounted)!
+        support_kind = "unsupported_floating"
         z0 = max(z0_raw, z_floor + 0.002)
         z1 = min(z1_raw, z_ceil - 0.002)
         if z0_raw <= z_floor + 0.06:
@@ -529,6 +537,43 @@ def build_clutter_parts(
                         z0 = ts.z_top + 0.004
                         support_kind = f"tabletop_{ts.table_id}"
                         break
+            if support_kind == "unsupported_floating":
+                if (z_ceil - z1_raw) <= 0.75:
+                    support_kind = "ceiling_suspended"
+                else:
+                    # Check if mounted flush against interior shell wall (dist <= 0.12m)
+                    dist_wall = float(shell.inner_uv.exterior.distance(pt_uv))
+                    # Account for half-depth of object touching the wall
+                    min_xy_raw = min(
+                        float(np.percentile(pts_u[:, 0], 98) - np.percentile(pts_u[:, 0], 2)),
+                        float(np.percentile(pts_u[:, 1], 98) - np.percentile(pts_u[:, 1], 2)),
+                    )
+                    if dist_wall <= 0.5 * min_xy_raw + 0.12:
+                        support_kind = "wall_mounted"
+
+        # Gravity / Anti-Floating-Noise Gate: reject unsupported mid-air noise clusters!
+        if support_kind == "unsupported_floating":
+            rejected_logs.append({
+                "cluster_idx": ci,
+                "point_count": int(len(rel_idx)),
+                "z_above_floor_m": round(z0_raw - z_floor, 3),
+                "reason": "rejected_unsupported_floating_noise",
+            })
+            continue
+        if support_kind == "wall_mounted" and len(rel_idx) < 2000:
+            rejected_logs.append({
+                "cluster_idx": ci,
+                "point_count": int(len(rel_idx)),
+                "reason": "rejected_sparse_wall_bleed_noise",
+            })
+            continue
+        if support_kind == "ceiling_suspended" and len(rel_idx) < 1000:
+            rejected_logs.append({
+                "cluster_idx": ci,
+                "point_count": int(len(rel_idx)),
+                "reason": "rejected_sparse_ceiling_noise",
+            })
+            continue
         if z1 <= z0 + 0.012:
             rejected_logs.append({"cluster_idx": ci, "point_count": int(len(rel_idx)), "reason": "zero_or_paper_thin_height"})
             continue
@@ -580,10 +625,15 @@ def build_clutter_parts(
         if ocyl is not None:
             candidates.append(ocyl)
 
-        # Fit candidate 4: Triangular Pyramid / Cone (B18: 三角锥)
-        cone = _fit_cone_or_pyramid(pts_u, z0, z1)
-        if cone is not None:
-            candidates.append(cone)
+        # Fit candidate 4: Triangular Pyramid / Cone (B18: 三角锥 — MUST be floor/tabletop supported, never floating!)
+        if support_kind == "floor_resting" or support_kind.startswith("tabletop_"):
+            cone = _fit_cone_or_pyramid(pts_u, z0, z1)
+            if cone is not None:
+                candidates.append(cone)
+
+        # Wall-mounted fixtures must be rectangular boxes (never floating cones/oblique cylinders!)
+        if support_kind == "wall_mounted":
+            candidates = [c for c in candidates if c["kind"] == "box"]
 
         # Pick best-fitting primitive (small 8mm parsimony bonus for box when tied)
         def _rank_key(cand: dict[str, Any]) -> float:
@@ -606,7 +656,18 @@ def build_clutter_parts(
 
         # B18 regularity & anti-over-envelope gate!
         is_thin_fixture = (min(L, D, H) <= 0.14) and (float(best["p90"]) <= 0.032) and (len(pts_u) >= 25)
-        if float(best["p90"]) > cfg.regularity_max_surface_p90_m or float(best["p50"]) > cfg.regularity_max_surface_p50_m:
+        # Allow slightly wider p90 (<= 7.8cm) ONLY for dense, grounded 3+-face boxes (e.g., recessed fire-hydrant box
+        # whose door panel or wall-mixed corner adds a 7cm tail while p50 <= 3.0cm stays razor-tight!)
+        is_dense_grounded_box = (
+            best["kind"] == "box"
+            and support_kind == "floor_resting"
+            and len(rel_idx) >= 3000
+            and best["supported_faces"] >= 3
+            and vol_box <= 0.65
+            and float(best["p50"]) <= 0.030
+        )
+        max_p90_allow = 0.078 if is_dense_grounded_box else cfg.regularity_max_surface_p90_m
+        if float(best["p90"]) > max_p90_allow or float(best["p50"]) > cfg.regularity_max_surface_p50_m:
             rejected_logs.append({
                 "cluster_idx": ci,
                 "point_count": int(len(rel_idx)),
@@ -668,6 +729,8 @@ def build_clutter_parts(
                     v_uvz, tri = make_oriented_cylinder(
                         p0, p1, max(float(best["radius"]) * shrink, 0.025), segments=cfg.cylinder_segments
                     )
+                    if best["kind"] == "cylinder_oblique" and float(v_uvz[:, 2].min()) < z_floor + 0.002:
+                        v_uvz[:, 2] += (z_floor + 0.002) - float(v_uvz[:, 2].min())
                 else:  # triangular_pyramid or cone
                     bp = best["base_uvz"].copy()
                     ap = best["apex_uvz"].copy()

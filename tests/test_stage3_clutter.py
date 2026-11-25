@@ -134,15 +134,18 @@ def test_stage3_regular_clutter_primitives_and_semantic_exclusions(tmp_path: Pat
     c_box = _sample_box_surface(1.0, 1.5, 4.5, 4.9, 0.0, 0.60, step=0.03)
     c_mon = _sample_box_surface(1.5, 2.05, 1.32, 1.40, 0.76, 1.12, step=0.025)
     c_vcyl = _sample_cylinder_surface(np.array([3.5, 5.2, 0.0]), np.array([3.5, 5.2, 0.90]), 0.20)
-    c_ocyl = _sample_cylinder_surface(np.array([5.5, 1.5, 0.25]), np.array([6.2, 1.5, 1.15]), 0.12)
+    c_ocyl = _sample_cylinder_surface(np.array([5.5, 1.5, 0.08]), np.array([6.2, 1.5, 0.98]), 0.12)
     c_pyr = _sample_tri_pyramid(np.array([6.2, 5.2, 0.0]), np.array([6.2, 5.2, 0.75]), 0.32)
+
+    # Negative 0: Unsupported mid-air floating stray pyramid (z=0.60..1.05m in middle of room — MUST be rejected!)
+    c_float_pyr = _sample_tri_pyramid(np.array([4.0, 4.0, 0.60]), np.array([4.0, 4.0, 1.05]), 0.25)
 
     # Negative 1: Green potted plant (irregular canopy + green RGB)
     plant_pot = _sample_cylinder_surface(np.array([4.0, 2.5, 0.0]), np.array([4.0, 2.5, 0.35]), 0.14, n_ang=16, n_ax=8)
     plant_leaves = np.column_stack([
-        rng.normal(4.0, 0.22, 600),
-        rng.normal(2.5, 0.22, 600),
-        rng.uniform(0.35, 1.45, 600),
+        rng.normal(4.0, 0.15, 1200),
+        rng.normal(2.5, 0.15, 1200),
+        rng.uniform(0.35, 1.35, 1200),
     ])
     c_plant = np.vstack([plant_pot, plant_leaves])
     rgb_plant = np.vstack([
@@ -160,7 +163,7 @@ def test_stage3_regular_clutter_primitives_and_semantic_exclusions(tmp_path: Pat
     # Assemble cloud + RGB
     neutral_blocks = [
         (floor, 1), (ceil, 0), (walls, 2), (table, 8),
-        (c_box, 12), (c_mon, 12), (c_vcyl, 12), (c_ocyl, 12), (c_pyr, 12), (c_ped, 12),
+        (c_box, 12), (c_mon, 12), (c_vcyl, 12), (c_ocyl, 12), (c_pyr, 12), (c_float_pyr, 12), (c_ped, 12),
     ]
     pts_list = [b[0] for b in neutral_blocks] + [c_plant]
     cls_list = [np.full(len(b[0]), b[1], dtype=np.uint8) for b in neutral_blocks] + [np.full(len(c_plant), 12, dtype=np.uint8)]
@@ -185,4 +188,5 @@ def test_stage3_regular_clutter_primitives_and_semantic_exclusions(tmp_path: Pat
 
     rej_reasons = {r["reason"] for r in cl["rejected"]}
     assert "excluded_semantic_plant_rgb" in rej_reasons, cl["rejected"]
+    assert "rejected_unsupported_floating_noise" in rej_reasons, cl["rejected"]
     assert any("pedestrian" in r or "irregular" in r for r in rej_reasons), cl["rejected"]

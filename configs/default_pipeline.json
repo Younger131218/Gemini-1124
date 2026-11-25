@@ -77,7 +77,7 @@
   },
   "clutter": {
     "enabled": true,
-    "min_points": 250,
+    "min_points": 600,
     "voxel_cluster_size_m": 0.055,
     "min_extent_m": 0.035,
     "min_major_span_m": 0.16,
